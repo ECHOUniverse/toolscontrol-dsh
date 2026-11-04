@@ -1,0 +1,12 @@
+# @hanxu131/toolscontrol-dsh bundle patch: mounts the read-only MCP/Skills
+# overview host half into a dsh profile.
+# The Host half (lib/index.js) mounts the aggregation services through late
+# `ctx.inject` effects and registers the `/toolscontrol` routes when the
+# profile provides a webServer + connection pair.
+#
+# Install: dsh plugin --profile <name> add @hanxu131/toolscontrol-dsh
+# Local:   dsh plugin --profile <name> add link:/path/to/toolscontrol-dsh
+- insert:
+    - id: toolscontrol
+      # Quoted because `@` is a reserved YAML indicator.
+      name: '@hanxu131/toolscontrol-dsh'

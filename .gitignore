@@ -1,0 +1,16 @@
+# Build output
+lib/
+
+# Dependencies
+node_modules/
+
+# Packed artifacts
+*.tgz
+*.tar.gz
+
+# Logs and local state
+*.log
+.DS_Store
+
+# Scratch directories
+.tmp/
