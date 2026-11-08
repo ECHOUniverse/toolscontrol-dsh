@@ -2,10 +2,15 @@
  * Public controller of the two read-only overview tabs.
  *
  * This is the framework-free seam between the wire snapshot and the React
- * views: the controller owns the overview fetch (same-origin), workspace
- * tracking over the official `sessions.list` / `workspaces.list` stores,
- * per-tab filters, probe requests and language-dependent ordering. React
- * binds it through `getSnapshot` / `subscribe` (useSyncExternalStore).
+ * views: the controller owns the overview fetch (same-origin), workspace and
+ * main-session tracking over the official `sessions.list` /
+ * `workspaces.list` stores, per-tab filters, probe requests and
+ * language-dependent ordering. React binds it through `getSnapshot` /
+ * `subscribe` (useSyncExternalStore).
+ *
+ * The request carries both `cwd` (project discovery context) and `sessionId`
+ * (the live session whose preset scope holds its Skills); the host must use
+ * the session scope, not cwd alone.
  *
  * Race discipline: every fetch/probe runs under a monotonic sequence number
  * and its own AbortSignal; a late settlement of a superseded request is
@@ -43,8 +48,8 @@ export interface ObservableStore<T> {
 
 /** Injected dependencies — all swappable for tests. */
 export interface ControllerDeps {
-  /** Same-origin `GET /toolscontrol/overview?cwd=…` with cancellation. */
-  fetchOverview(args: { cwd?: string; signal: AbortSignal }): Promise<OverviewSnapshot>
+  /** Same-origin `GET /toolscontrol/overview?cwd=…&sessionId=…` with cancellation. */
+  fetchOverview(args: { cwd?: string; sessionId?: string; signal: AbortSignal }): Promise<OverviewSnapshot>
   /** Same-origin explicit `POST /toolscontrol/mcp/probe`. */
   probe(args: { server: string; signal: AbortSignal }): Promise<McpProbeResponse>
   /** Official `sessions.list` store (optional: plain-environment fallback). */
@@ -151,7 +156,8 @@ export class ToolscontrolController {
    * subscriptions (exactly once) and runs the initial fetch; every later call
    * — re-entering the tab remounts the section — re-fetches in place, so the
    * view always shows a fresh snapshot. Store notifications still re-fetch
-   * ONLY when `cwd` actually changed.
+   * ONLY when `cwd` or the main session's `sessionId` actually changed (the
+   * session's preset scope selects different Skills even under one cwd).
    */
   ensure(): void {
     if (this.disposed) return
@@ -164,7 +170,7 @@ export class ToolscontrolController {
     void this.load()
   }
 
-  /** Manual refresh: aborts any in-flight fetch and re-requests the current cwd. */
+  /** Manual refresh: aborts any in-flight fetch and re-requests the current workspace/session context. */
   refresh(): void {
     if (this.disposed) return
     void this.load()
@@ -255,8 +261,11 @@ export class ToolscontrolController {
     if (this.disposed) return
     const next = resolveWorkspaceContext(this.deps.sessions?.getSnapshot(), this.deps.workspaces?.getSnapshot())
     const previousCwd = this.state.workspace.cwd
+    const previousSessionId = this.state.workspace.sessionId
     this.applyWorkspace(next)
-    if (next.cwd !== previousCwd) void this.load()
+    // 同一 cwd 下也可能切换到另一主 Session：会话级 preset scope 可能不同，
+    // 因此 sessionId 变化同样必须重新获取。
+    if (next.cwd !== previousCwd || next.sessionId !== previousSessionId) void this.load()
   }
 
   /** Publish the resolved workspace even when cwd is unchanged (title etc.). */
@@ -275,12 +284,13 @@ export class ToolscontrolController {
     const controller = new AbortController()
     this.abortCurrent?.abort()
     this.abortCurrent = controller
-    const cwd = this.state.cwd
+    const { cwd, sessionId } = this.state.workspace
     this.state = { ...this.state, status: 'loading' }
     this.derive()
     try {
       const snapshot = await this.deps.fetchOverview({
         ...(cwd !== null ? { cwd } : {}),
+        ...(sessionId !== null ? { sessionId } : {}),
         signal: controller.signal,
       })
       if (this.disposed || seq !== this.fetchSeq) return

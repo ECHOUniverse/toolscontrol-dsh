@@ -44,6 +44,8 @@ export interface RouteDeps {
 const MAX_JSON_BODY_BYTES = 64 * 1024
 /** cwd 参数长度上限（文件系统路径预算）。 */
 const MAX_CWD_LENGTH = 4096
+/** sessionId 参数长度上限（官方 SessionId 的长度预算）。 */
+const MAX_SESSION_ID_LENGTH = 256
 
 /** 在组合 webServer 上注册整张路由表，返回注销函数。 */
 export function registerRoutes(webServer: WebServerFace, deps: RouteDeps): () => void {
@@ -80,7 +82,11 @@ export function registerRoutes(webServer: WebServerFace, deps: RouteDeps): () =>
           if (method !== 'GET') return sendMethodNotAllowed(res, 'GET')
           const cwd = cwdParamOf(url)
           if (cwd === null) return sendError(res, 400, 'invalid_input', 'cwd must be an absolute filesystem path')
-          const snapshot: OverviewSnapshot = await overview.snapshot(cwd ?? undefined)
+          const sessionId = sessionIdParamOf(url)
+          if (sessionId === null) {
+            return sendError(res, 400, 'invalid_input', 'sessionId must be a non-empty session identifier (max 256 chars)')
+          }
+          const snapshot: OverviewSnapshot = await overview.snapshot(cwd ?? undefined, sessionId)
           return sendJson(res, 200, snapshot)
         }
 
@@ -118,5 +124,18 @@ function cwdParamOf(url: URL): string | undefined | null {
   if (raw.length > MAX_CWD_LENGTH) return null
   if (raw.includes('\0')) return null
   if (!raw.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(raw)) return null
+  return raw
+}
+
+/**
+ * 校验 `sessionId` 查询参数：官方会话标识（不透明字符串）。空值视为
+ * 未提供（全局视图）；超长或含 ASCII 控制字符视为非法。该值只用于
+ * `agents.get(sessionId)`，不拼接任何路径或命令。
+ */
+function sessionIdParamOf(url: URL): string | undefined | null {
+  const raw = url.searchParams.get('sessionId')
+  if (raw === null || raw === '') return undefined
+  if (raw.length > MAX_SESSION_ID_LENGTH) return null
+  if (/[\u0000-\u001f\u007f]/.test(raw)) return null
   return raw
 }

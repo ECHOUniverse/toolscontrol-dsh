@@ -36,9 +36,17 @@ function assertOverview(data: unknown): OverviewSnapshot {
   return data as OverviewSnapshot
 }
 
-/** `GET /toolscontrol/overview?cwd=…` (cwd omitted for the global view). */
-export async function fetchOverview(args: { cwd?: string; signal: AbortSignal }): Promise<OverviewSnapshot> {
-  const query = typeof args.cwd === 'string' && args.cwd !== '' ? `?cwd=${encodeURIComponent(args.cwd)}` : ''
+/**
+ * `GET /toolscontrol/overview?cwd=…&sessionId=…` (both omitted for the
+ * global view; sessionId selects the session's preset skill scope).
+ */
+export async function fetchOverview(args: { cwd?: string; sessionId?: string; signal: AbortSignal }): Promise<OverviewSnapshot> {
+  const params: string[] = []
+  if (typeof args.cwd === 'string' && args.cwd !== '') params.push(`cwd=${encodeURIComponent(args.cwd)}`)
+  if (typeof args.sessionId === 'string' && args.sessionId !== '') {
+    params.push(`sessionId=${encodeURIComponent(args.sessionId)}`)
+  }
+  const query = params.length > 0 ? `?${params.join('&')}` : ''
   const response = await fetch(`${ROUTES.overview}${query}`, {
     signal: args.signal,
     headers: { accept: 'application/json' },

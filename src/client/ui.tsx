@@ -27,14 +27,14 @@
 import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { ToolscontrolController, type ClientState, type ControllerDeps as ToolscontrolControllerDeps, type ObservableStore, type ProbeState } from './controller.ts'
 import { fetchOverview, probeServer } from './api.ts'
-import { NS, en, zh } from './i18n.ts'
+import { NS, en, sourceLabel, warningTexts, zh, type MessageTranslate } from './i18n.ts'
 import { CSS } from './styles.ts'
-import type { McpCapabilities, McpConnectionStatus, McpServerEntry, SkillEntry } from '../shared/protocol.ts'
-import type { SkillRow } from './view-model.ts'
+import type { McpCapabilities, McpConnectionStatus, McpPresetRef, McpServerEntry, SkillEntry } from '../shared/protocol.ts'
+import { mcpEmptyStateKey, skillsScopeLine, type SkillRow } from './view-model.ts'
 import type { SessionsListShape, WorkspacesListShape } from './workspace.ts'
 
 /** Translate function bound to this plugin's locale namespace. */
-export type TranslateFn = (key: string, params?: Record<string, string | number>) => string
+export type TranslateFn = MessageTranslate
 
 /** Locale service face (rc.5 `dsh-client-locale`, consumed subset). */
 export interface LocaleFace {
@@ -109,6 +109,29 @@ function idFragment(value: string): string {
   return encodeURIComponent(value).replace(/[%'()*.!]/g, '_')
 }
 
+/**
+ * Unique row identity. The same entry name may exist both at the profile root
+ * and inside a preset — those are DIFFERENT configuration items, so the key
+ * carries the scope and preset id (React keys, expansion state, DOM ids).
+ */
+function mcpEntryKey(server: McpServerEntry): string {
+  return `${server.scope}:${server.preset?.id ?? ''}:${server.name}`
+}
+
+/** Human label of a preset reference (official display name when present). */
+function presetRefLabel(preset: McpPresetRef): string {
+  return preset.name ?? preset.id
+}
+
+/** Row scope label: profile root, preset composition, or undeterminable. */
+function mcpScopeLabel(server: McpServerEntry, t: TranslateFn): string {
+  if (server.scope === 'preset' && server.preset !== undefined) {
+    return t('mcp.scope.preset', { name: presetRefLabel(server.preset) })
+  }
+  if (server.scope === 'profile') return t('mcp.scope.profile')
+  return t('mcp.scope.unknown')
+}
+
 function initialOf(name: string): string {
   const first = name.trim().charAt(0)
   return first === '' ? '?' : first.toUpperCase()
@@ -134,7 +157,7 @@ function Notice(props: { children: ReactNode }): ReactNode {
   )
 }
 
-function Pill(props: { active: boolean; label: string; onClick: () => void; children: ReactNode }): ReactNode {
+function Pill(props: { active: boolean; label: string; title?: string; onClick: () => void; children: ReactNode }): ReactNode {
   return (
     <button
       type="button"
@@ -142,16 +165,12 @@ function Pill(props: { active: boolean; label: string; onClick: () => void; chil
       data-active={props.active}
       aria-pressed={props.active}
       aria-label={props.label}
+      title={props.title}
       onClick={props.onClick}
     >
       {props.children}
     </button>
   )
-}
-
-/** '未知' for unknown sources; raw labels otherwise (identity strings). */
-function sourceLabel(source: string, t: TranslateFn): string {
-  return source === 'unknown' || source === '' ? t('field.sourceUnknown') : source
 }
 
 function statusLabel(status: McpConnectionStatus, t: TranslateFn): string {
@@ -245,6 +264,8 @@ function ListBody(props: {
   rowsCount: number
   /** Raw entry count in the snapshot (before filters). */
   rawCount: number
+  /** Wording for the true empty state (tab-specific honesty); defaults to neutral. */
+  emptyText?: string
   children: ReactNode
   onRetry: () => void
   t: TranslateFn
@@ -268,7 +289,9 @@ function ListBody(props: {
     return <Skeleton />
   }
   if (props.rowsCount === 0) {
-    return <p className="dshTcMeta">{props.rawCount === 0 ? t('state.emptyAll') : t('state.emptyFiltered')}</p>
+    return (
+      <p className="dshTcMeta">{props.rawCount === 0 ? (props.emptyText ?? t('state.emptyAll')) : t('state.emptyFiltered')}</p>
+    )
   }
   return <>{props.children}</>
 }
@@ -288,11 +311,12 @@ function McpRow(props: {
   t: TranslateFn
 }): ReactNode {
   const { server, capabilities, probe, t } = props
-  const detailId = `${props.idBase}-${idFragment(server.name)}-detail`
+  const entryKey = mcpEntryKey(server)
+  const detailId = `${props.idBase}-${idFragment(entryKey)}-detail`
   const statusKnown = capabilities.connectionStatus === true
   const toolCountKnown = capabilities.toolCount === true && typeof server.toolCount === 'number'
   return (
-    <li className="dshTcRow" data-mcp-entry={server.name}>
+    <li className="dshTcRow" data-mcp-entry={server.name} data-mcp-scope={server.scope}>
       <div className="dshTcRowHead">
         <span className="dshTcRowIcon" aria-hidden="true">
           {initialOf(server.name)}
@@ -311,13 +335,20 @@ function McpRow(props: {
               </span>
               {server.name}
             </button>
-            {server.enabled ? <Tag tone="success">{t('mcp.entryEnabled')}</Tag> : <Tag>{t('mcp.entryDisabled')}</Tag>}
+            {server.conditional === true ? (
+              <Tag tone="info">{t('mcp.entryConditional')}</Tag>
+            ) : server.enabled ? (
+              <Tag tone="success">{t('mcp.entryEnabled')}</Tag>
+            ) : (
+              <Tag>{t('mcp.entryDisabled')}</Tag>
+            )}
           </div>
           <div className="dshTcTags">
             <Tag tone={statusTone(server.status, statusKnown)}>
               <Dot tone={statusKnown ? statusTone(server.status, true) : 'idle'} />
               {statusKnown ? statusLabel(server.status, t) : t('mcp.status.unknown')}
             </Tag>
+            <Tag tone={server.scope === 'preset' ? 'info' : undefined}>{mcpScopeLabel(server, t)}</Tag>
             <Tag>{sourceLabel(server.source, t)}</Tag>
             {toolCountKnown ? <Tag>{t('mcp.tools', { n: server.toolCount as number })}</Tag> : null}
           </div>
@@ -329,6 +360,10 @@ function McpRow(props: {
             <div>
               <dt>{t('field.status')}</dt>
               <dd>{statusKnown ? statusLabel(server.status, t) : t('mcp.status.unknown')}</dd>
+            </div>
+            <div>
+              <dt>{t('mcp.scopeLabel')}</dt>
+              <dd>{mcpScopeLabel(server, t)}</dd>
             </div>
             <div>
               <dt>{t('field.source')}</dt>
@@ -402,6 +437,7 @@ export function McpSection(props: SectionProps): ReactNode {
   if (tc === undefined || t === undefined) return null
   const snapshot = state.snapshot
   const mcp = snapshot?.mcp
+  const warningLines = mcp === undefined ? [] : warningTexts(mcp.warnings, mcp.warningItems, t)
   const busy = state.status === 'loading'
   return (
     <div className="dshTc" data-plugin-tab="toolscontrol-mcp">
@@ -475,9 +511,9 @@ export function McpSection(props: SectionProps): ReactNode {
         </div>
       ) : null}
       {mcp !== undefined && mcp.capabilities.connectionStatus === false ? <Notice>{t('mcp.capabilityNote')}</Notice> : null}
-      {mcp !== undefined && mcp.warnings.length > 0 ? (
+      {mcp !== undefined && warningLines.length > 0 ? (
         <Notice>
-          {t('warnings.title')}: {mcp.warnings.join(' · ')}
+          {t('warnings.title')}: {warningLines.join(' · ')}
         </Notice>
       ) : null}
       {state.error !== null && state.stale ? <Notice>{t('state.staleNotice', { message: state.error })}</Notice> : null}
@@ -485,29 +521,33 @@ export function McpSection(props: SectionProps): ReactNode {
         state={state}
         rowsCount={state.mcpRows.length}
         rawCount={mcp?.servers.length ?? 0}
+        emptyText={t(mcpEmptyStateKey(mcp))}
         onRetry={() => {
           tc.refresh()
         }}
         t={t}
       >
         <ul className="dshTcRows" aria-busy={busy}>
-          {state.mcpRows.map((server) => (
-            <McpRow
-              key={server.name}
-              server={server}
-              capabilities={mcp!.capabilities}
-              probe={state.probes[server.name]}
-              expanded={expanded === server.name}
-              idBase="tc-mcp"
-              onToggle={() => {
-                setExpanded((current) => (current === server.name ? null : server.name))
-              }}
-              onProbe={(serverName) => {
-                tc.requestProbe(serverName)
-              }}
-              t={t}
-            />
-          ))}
+          {state.mcpRows.map((server) => {
+            const entryKey = mcpEntryKey(server)
+            return (
+              <McpRow
+                key={entryKey}
+                server={server}
+                capabilities={mcp!.capabilities}
+                probe={state.probes[server.name]}
+                expanded={expanded === entryKey}
+                idBase="tc-mcp"
+                onToggle={() => {
+                  setExpanded((current) => (current === entryKey ? null : entryKey))
+                }}
+                onProbe={(serverName) => {
+                  tc.requestProbe(serverName)
+                }}
+                t={t}
+              />
+            )
+          })}
         </ul>
       </ListBody>
     </div>
@@ -655,7 +695,8 @@ export function SkillsSection(props: SectionProps): ReactNode {
   const snapshot = state.snapshot
   const skills = snapshot?.skills
   const busy = state.status === 'loading'
-  const workspaceTitle = state.workspace.workspaceTitle ?? state.workspace.cwd
+  const warningLines = skills === undefined ? [] : warningTexts(skills.warnings, skills.warningItems, t)
+  const scopeLine = skillsScopeLine(state.workspace)
   return (
     <div className="dshTc" data-plugin-tab="toolscontrol-skills">
       <Toolbar
@@ -674,29 +715,30 @@ export function SkillsSection(props: SectionProps): ReactNode {
         t={t}
       />
       <div className="dshTcMetaLine">
-        {workspaceTitle !== null && workspaceTitle !== undefined ? (
-          <span className="dshTcMeta" title={state.workspace.cwd ?? undefined}>
-            {t('workspace.title', { title: workspaceTitle })}
-          </span>
-        ) : (
-          <span className="dshTcMeta">{t('workspace.none')}</span>
-        )}
+        <span className="dshTcMeta" title={state.workspace.cwd ?? undefined}>
+          {scopeLine.key === 'workspace.title'
+            ? t('workspace.title', { title: scopeLine.title })
+            : scopeLine.key === 'workspace.sessionNoCwd'
+              ? t('workspace.sessionNoCwd', { sessionId: scopeLine.sessionId })
+              : t('workspace.none')}
+        </span>
       </div>
       <div className="dshTcPills" role="group" aria-label={t('filter.source')}>
         <Pill
           active={state.skillsFilters.source === 'all'}
-          label={t('common.all')}
+          label={t('skills.filter.allSources')}
           onClick={() => {
             tc.setSkillsFilters({ source: 'all' })
           }}
         >
-          {t('common.all')}
+          {t('skills.filter.allSources')}
         </Pill>
         {state.skillSourceOptions.map((source) => (
           <Pill
             key={source}
             active={state.skillsFilters.source === source}
             label={sourceLabel(source, t)}
+            title={source}
             onClick={() => {
               tc.setSkillsFilters({ source })
             }}
@@ -708,12 +750,12 @@ export function SkillsSection(props: SectionProps): ReactNode {
       <div className="dshTcPills" role="group" aria-label={t('filter.invocation')}>
         <Pill
           active={state.skillsFilters.invocation === 'all'}
-          label={t('common.all')}
+          label={t('skills.filter.allInvocations')}
           onClick={() => {
             tc.setSkillsFilters({ invocation: 'all' })
           }}
         >
-          {t('common.all')}
+          {t('skills.filter.allInvocations')}
         </Pill>
         <Pill
           active={state.skillsFilters.invocation === 'user'}
@@ -743,9 +785,9 @@ export function SkillsSection(props: SectionProps): ReactNode {
           {t('filter.invocation.none')}
         </Pill>
       </div>
-      {skills !== undefined && skills.warnings.length > 0 ? (
+      {skills !== undefined && warningLines.length > 0 ? (
         <Notice>
-          {t('warnings.title')}: {skills.warnings.join(' · ')}
+          {t('warnings.title')}: {warningLines.join(' · ')}
         </Notice>
       ) : null}
       {state.error !== null && state.stale ? <Notice>{t('state.staleNotice', { message: state.error })}</Notice> : null}

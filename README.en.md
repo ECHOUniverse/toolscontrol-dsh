@@ -6,15 +6,22 @@ A standalone DSH Desktop plugin: adds two READ-ONLY tabs — **MCP** and **Skill
 
 ## Features
 
-- **MCP tab**: name search; enabled-state filter (Enabled / Disabled / All, default shows enabled only); connection-status filter; manual refresh with last-refreshed time; inline detail (connection status, source, configured flag).
-- **Skills tab**: name/description/when-to-use search; source filter; invocation filter (user-invocable / model-invocable / neither); manual refresh; inline detail (description, whenToUse, source, path, invocation policy). Same-name **shadowed** versions appear ONLY inside the effective entry's detail — never as independent main rows.
-- **Workspace tracking**: follows the workspace currently selected in the Desktop sidebar (the main session's `retainedBy.mainView`); switching workspaces re-fetches with the new `cwd`. With no main session the tab clearly states “No workspace selected — showing global skills” and never guesses a default directory.
+- **MCP tab**: name search; enabled-state filter (Enabled / Disabled / All, default shows enabled only); connection-status filter; manual refresh with last-refreshed time; inline detail (connection status, scope, source, configured flag). Entries are labeled with their DSH composition scope — **DSH profile root** or **Preset: <name>**. Same-name entries in different scopes are listed separately and never merged into one global entry.
+- **Skills tab**: name/description/when-to-use search; source filter (All sources plus each source); invocation filter (All invocation modes / user-invocable / model-invocable / not invocable); manual refresh; inline detail (description, when to use, source, path, invocation policy). Same-name **overridden** versions appear ONLY inside the effective entry's detail — never as independent main rows. Sources follow the host language (for example “DSH built-in”, “Plugin runtime”, “User .dsh directory”, “Project .agents directory”); unknown or future sources fall back to the raw id.
+- **Workspace & session tracking**: follows the workspace currently selected in the Desktop sidebar (the main session's `retainedBy.mainView`); switching workspaces re-fetches with the new `cwd`. Skills are also read through that main session's live Agent **preset scope** (the request carries `sessionId`), and switching sessions under the same cwd re-fetches too. With no main session the tab clearly states “No workspace selected — showing global skills”, shows the global registry only, and never guesses a default directory. With a main session but an unknown project directory it says so and reports the session preset scope — never as global or session results by guesswork.
 - **Bilingual**: zh/en UI strings registered with the host locale and following the host language; entry names are never translated; lists sort stably via `Intl.Collator` bound to the active language.
 - **Keyboard accessible**: inline expansion uses real buttons (`aria-expanded` / `aria-controls`) with host-token focus rings.
 
 ## rc.5 capability boundary (Desktop 0.2.1-rc.5)
 
-MCP data comes from the pluginInventory config layer (`mode: "config"`):
+MCP data comes from the pluginInventory config layer (`mode: "config"`), merging BOTH composition surfaces of the official `list()`:
+
+- **Profile root** `entries`: Loader entries of the current Desktop profile's root composition (scope label “DSH profile root”);
+- **Preset compositions** `agentPresets[].rows`: rows declared inside each agent preset (scope label “Preset: <name>”). In current DSH the session preset layer is where model-facing plugins actually run, so an MCP server configured only inside a preset must still show up.
+
+Deduplication: within one `(scope, preset id, entry name)` only the first row is kept and the page warnings state how many duplicates were ignored; **the same name in different scopes is NOT a duplicate** and both entries are listed. A preset row without a Loader entry id (the official type allows `entryId: null`) falls back to the module name. A row whose `disabled` is an expression (official `'conditional'`) cannot be resolved statically, so the UI labels it “Conditionally enabled” instead of pretending it is statically enabled/disabled. An MCP row's `enabled` accepts only a boolean or `'conditional'`; a missing or other-typed value never defaults to enabled — that row is skipped with a warning. Malformed data (`agentPresets` not an array, preset without id, `rows` not an array, unparsable rows) is skipped item by item with a warning — the snapshot never fails as a whole.
+
+When the entire DSH composition (profile root plus every preset) was read COMPLETELY and declares no MCP server, the empty state explicitly says **“No MCP server is configured in the current DSH profile or its presets (DSH-internal sources only; external CLI configs are not read)”**. That is a conclusion about a complete readable snapshot, not a claim about any external CLI's configuration. Any unavailable source or unparsable surface/row sets `canAssertEmpty=false`, so the UI falls back to the neutral empty state with the warnings and never claims “not configured”.
 
 | Capability | rc.5 | Behavior |
 | --- | --- | --- |
@@ -24,12 +31,12 @@ MCP data comes from the pluginInventory config layer (`mode: "config"`):
 
 When the official managed `mcpManager` becomes available (`mode: "managed"`): real connection statuses and tool counts appear; the “Load tool list” button lives inside the row detail and a probe POST (by name only, never touching configuration) fires **only on explicit user click** — never automatically.
 
-Skills limitation: shadowed versions are not guaranteed complete — **runtime, preset and custom-directory competitors cannot be fully enumerated**. The enumeration-limit warnings returned by the host always render as a banner; a single-source failure never blanks the page (partial data + warnings), and a true request failure with no previous data shows the error empty state, while existing data is retained with a stale notice.
+Skills limitation: overridden versions are not guaranteed complete — **runtime, preset and custom-directory competitors cannot be fully enumerated**. The enumeration-limit notes returned by the host always render in the Notes section; a single-source failure never blanks the page (partial data + notes), and a true request failure with no previous data shows the error empty state, while existing data is retained with a stale notice.
 
 ## Security model
 
 - Host routes are same-origin under `/toolscontrol`: only `health` is public (plugin identity); `overview` / `mcp/probe` pass the official `connection.requestRejection` trust fence (authentication + Host/Origin/`sec-fetch-site`).
-- Wire payloads **never carry** MCP env / headers / tokens / commands / URLs; the client uses plain same-origin `fetch` and reads no configuration files.
+- Wire payloads **never carry** MCP env / headers / tokens / commands / URLs; the client uses plain same-origin `fetch` and reads no configuration files. MCP data comes only from DSH's own composition (pluginInventory): **`~/.cursor`, `~/.kimi-code`, `~/.config/mcp` and other external CLI configs are never read**, and no external MCP adapters are added.
 - No sensitive configuration is rendered; there are no Switch-style mutation controls.
 
 ## Install & uninstall

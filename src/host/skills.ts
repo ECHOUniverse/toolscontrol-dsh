@@ -1,9 +1,14 @@
 /**
  * Skills 只读聚合（CONTEXT.md「Skills」）。
  *
- * 生效项始终来自官方 `ctx.skills` 注册表（赢家为主，插件不自行替换）；
- * 以请求的 cwd（当前选中工作区）作为项目级发现上下文。注册表缺失或
- * 读取失败 → 单来源降级 + warning，快照不整体失败。
+ * 生效项始终来自官方 `ctx.skills` 注册表（赢家为主，插件不自行替换）。
+ * 请求携带 sessionId 时按官方 `sessionSkillCatalog` 的链路读取：
+ * `agents.get(sessionId)` → live Agent（同时作为 scope）→
+ * `agentPresets.serviceFor(live, 'skills') ?? ctx.skills` →
+ * `registry.list({ cwd, scope: live })`。当前 DSH 的 skill-filesystem
+ * 注册在会话 preset scope，只用 cwd 会漏掉会话实际的 Skills。没有 live
+ * Agent 时回退旧的全局读取并给出诚实 warning。注册表缺失或读取失败 →
+ * 单来源降级 + warning，快照不整体失败。
  *
  * 同名被遮蔽版本由只读文件扫描补充（官方已确认的 Skills 根目录）：
  * 目录包 `<root>/<name>/SKILL.md`、平铺 `<root>/<name>.md`，不递归嵌套。
@@ -27,7 +32,8 @@ import { join } from 'node:path'
 import { parse } from 'yaml'
 import type { SkillEntry, SkillInvocationPolicy, SkillsSnapshot } from '../shared/protocol.ts'
 import { errorMessage } from './services.ts'
-import type { SkillSummaryFace, SkillsRegistryFace } from './services.ts'
+import type { AgentFace, AgentPresetsFace, AgentsFace, SkillSummaryFace, SkillsRegistryFace } from './services.ts'
+import { warn, warningLog, type WarningLog } from './warnings.ts'
 
 /**
  * 来源优先级（官方 skill-filesystem rc.5 常量：低者胜；runtime 注册夹在
@@ -49,6 +55,10 @@ const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 /** 晚绑定注入的服务集合。 */
 export interface SkillCatalogServices {
   registry?: SkillsRegistryFace
+  /** `ctx.agents`：把请求的 sessionId 映射到 live Agent（也是会话 scope）。 */
+  agents?: AgentsFace
+  /** `ctx.agentPresets`：解析会话 preset 组合内挂载的 skills 服务。 */
+  presets?: AgentPresetsFace
 }
 
 /** 用户根目录覆盖（默认 `$DSH_HOME`/`~/.dsh`、`$DSH_AGENTS_HOME`/`~/.agents`）。 */
@@ -57,8 +67,7 @@ export interface SkillCatalogRoots {
   agentsHome?: string
 }
 
-export interface SkillCatalogOptions {
-  registry?: SkillsRegistryFace
+export interface SkillCatalogOptions extends SkillCatalogServices {
   roots?: SkillCatalogRoots
 }
 
@@ -77,54 +86,176 @@ type ParsedSkill =
 /** 只读 Skills 目录：生效项 + 同名被遮蔽项。 */
 export class SkillCatalog {
   private registry: SkillsRegistryFace | undefined
+  private agents: AgentsFace | undefined
+  private presets: AgentPresetsFace | undefined
   private readonly roots: SkillCatalogRoots
 
   constructor(options: SkillCatalogOptions = {}) {
     this.registry = options.registry
+    this.agents = options.agents
+    this.presets = options.presets
     this.roots = options.roots ?? {}
   }
 
   /** 晚绑定：对应 `ctx.inject` effect 触发时挂上服务。 */
   attachServices(services: SkillCatalogServices): void {
     if (services.registry !== undefined) this.registry = services.registry
+    if (services.agents !== undefined) this.agents = services.agents
+    if (services.presets !== undefined) this.presets = services.presets
   }
 
   /** 晚绑定：服务 cycle/卸载时摘除。 */
-  detachServices(names: readonly ('registry')[]): void {
+  detachServices(names: readonly ('registry' | 'agents' | 'presets')[]): void {
     for (const name of names) {
       if (name === 'registry') this.registry = undefined
+      if (name === 'agents') this.agents = undefined
+      if (name === 'presets') this.presets = undefined
     }
   }
 
   /**
    * 当前可见 Skills 快照：生效项 + 同名被遮蔽项（文件来源可见的子集）。
    * 单来源失败只产生 warning，快照不整体失败。
+   *
+   * `sessionId` 存在时按官方 `sessionSkillCatalog` 的链路读取：
+   * `agents.get(sessionId)` → live Agent（同时作为 scope）→
+   * `agentPresets.serviceFor(live, 'skills') ?? ctx.skills` →
+   * `registry.list({ cwd, scope: live })`。没有 live Agent（或没有
+   * agents 服务）时回退旧的全局读取，并给出诚实 warning。
    */
-  async snapshot(cwd?: string): Promise<SkillsSnapshot> {
-    const registry = this.registry
-    if (registry === undefined) {
-      return { cwd: cwd ?? null, skills: [], warnings: ['skills 服务不可用：生效 Skill 无法枚举'] }
+  async snapshot(cwd?: string, sessionId?: string): Promise<SkillsSnapshot> {
+    const scopeWarnings = warningLog()
+    const target = this.resolveListTarget(cwd, sessionId, scopeWarnings)
+    if (target === undefined) {
+      warn(scopeWarnings, 'skills.unavailable', undefined, 'skills 服务不可用：生效 Skill 无法枚举')
+      return {
+        cwd: cwd ?? null,
+        skills: [],
+        warnings: scopeWarnings.warnings,
+        warningItems: scopeWarnings.warningItems,
+      }
     }
     let effective: readonly SkillSummaryFace[]
     try {
-      effective = await registry.list(cwd !== undefined ? { cwd } : {})
+      effective = await target.registry.list(target.options)
     } catch (error) {
-      return { cwd: cwd ?? null, skills: [], warnings: [`skills 注册表读取失败：${errorMessage(error)}`] }
+      warn(scopeWarnings, 'skills.registryFailed', { message: errorMessage(error) }, `skills 注册表读取失败：${errorMessage(error)}`)
+      return {
+        cwd: cwd ?? null,
+        skills: [],
+        warnings: scopeWarnings.warnings,
+        warningItems: scopeWarnings.warningItems,
+      }
     }
     const { entries, warnings } = await this.aggregate(effective, cwd)
-    return { cwd: cwd ?? null, skills: entries, warnings }
+    return {
+      cwd: cwd ?? null,
+      skills: entries,
+      warnings: [...scopeWarnings.warnings, ...warnings.warnings],
+      warningItems: [...scopeWarnings.warningItems, ...warnings.warningItems],
+    }
+  }
+
+  /**
+   * 解析本次读取应使用的注册表与 `list` 选项。
+   *
+   * 官方会话链路是 `agents.get(sessionId)` → live Agent（scope carrier）→
+   * `agentPresets.serviceFor(live, 'skills') ?? ctx.skills`。因此宿主
+   * registry 缺失时，只要 live 会话能解析出 preset 专属 skills 注册表，
+   * 仍可读取会话 Skills；只有宿主与 preset 都不可用才报不可用。
+   * 没有 live Agent（或没有 agents 服务）时保留旧的全局读取 + warning。
+   */
+  private resolveListTarget(
+    cwd: string | undefined,
+    sessionId: string | undefined,
+    warnings: WarningLog,
+  ): { registry: SkillsRegistryFace; options: { cwd?: string; scope?: object } } | undefined {
+    const options: { cwd?: string; scope?: object } = cwd !== undefined ? { cwd } : {}
+    if (sessionId === undefined || sessionId === '') {
+      // 未选择会话：全局视图是唯一可靠范围（UI 已明确标注“全局 Skills”）。
+      return this.registry !== undefined ? { registry: this.registry, options } : undefined
+    }
+    const live = this.liveAgent(sessionId, warnings)
+    if (live === undefined) {
+      // 兼容旧行为，但绝不把全局/文件扫描结果伪装成该会话的生效项。
+      return this.registry !== undefined ? { registry: this.registry, options } : undefined
+    }
+    const preset = this.presetRegistry(live, warnings)
+    const registry = preset ?? this.registry
+    if (registry === undefined) return undefined
+    return { registry, options: { ...options, scope: live } }
+  }
+
+  /** 官方 `agents.get(sessionId)`；服务缺失/查询失败/无 live 均降级为全局 + warning。 */
+  private liveAgent(sessionId: string, warnings: WarningLog): AgentFace | undefined {
+    const agents = this.agents
+    if (agents === undefined) {
+      warn(
+        warnings,
+        'skills.agentsUnavailable',
+        { sessionId },
+        `agents 服务不可用：无法确认会话 ${sessionId} 的 preset 范围，仅展示全局注册表`,
+      )
+      return undefined
+    }
+    try {
+      const live = agents.get(sessionId)
+      if (live === undefined) {
+        warn(
+          warnings,
+          'skills.sessionNoAgent',
+          { sessionId },
+          `会话 ${sessionId} 没有运行中的 Agent：无法读取该会话 preset 范围内的 Skills，仅展示全局注册表`,
+        )
+      }
+      return live
+    } catch (error) {
+      warn(
+        warnings,
+        'skills.sessionAgentFailed',
+        { sessionId, message: errorMessage(error) },
+        `会话 ${sessionId} 的 Agent 查询失败：${errorMessage(error)}；仅展示全局注册表`,
+      )
+      return undefined
+    }
+  }
+
+  /** 官方同源回退：preset 专属 skills 服务优先；缺失/解析失败返回 undefined 交由宿主兜底。 */
+  private presetRegistry(live: AgentFace, warnings: WarningLog): SkillsRegistryFace | undefined {
+    const presets = this.presets
+    if (presets === undefined) return undefined
+    try {
+      return presets.serviceFor(live, 'skills') ?? undefined
+    } catch (error) {
+      const message = errorMessage(error)
+      if (this.registry !== undefined) {
+        warn(
+          warnings,
+          'skills.presetFailedFallback',
+          { message },
+          `preset 专属 skills 服务解析失败：${message}；改用宿主 skills 注册表（仍带会话 scope）`,
+        )
+      } else {
+        warn(warnings, 'skills.presetFailed', { message }, `preset 专属 skills 服务解析失败：${message}`)
+      }
+      return undefined
+    }
   }
 
   /** 生效项 + 被遮蔽项合并与全部 warning 的产生。 */
   private async aggregate(effective: readonly SkillSummaryFace[], cwd?: string): Promise<{
     entries: SkillEntry[]
-    warnings: string[]
+    warnings: WarningLog
   }> {
     // 常驻枚举限制（CONTEXT.md「被遮蔽 Skill」）：任何非 bundled 赢家都
     // 可能有更高 rank 的运行时/preset/自定义目录竞争版本，文件扫描不可见。
-    const warnings: string[] = [
+    const warnings = warningLog()
+    warn(
+      warnings,
+      'skills.shadowedIncomplete',
+      undefined,
       '同名被遮蔽版本不保证完整：运行时、preset 与自定义目录来源的竞争版本不可完整枚举',
-    ]
+    )
     const winners = new Map<string, { summary: SkillSummaryFace; rank: number | undefined }>()
     for (const summary of effective) {
       winners.set(summary.name, { summary, rank: SKILL_SOURCE_RANK[summary.source] })
@@ -141,7 +272,7 @@ export class SkillCatalog {
   private async scanShadowed(
     cwd: string | undefined,
     winners: Map<string, { summary: SkillSummaryFace; rank: number | undefined }>,
-    warnings: string[],
+    warnings: WarningLog,
   ): Promise<SkillEntry[]> {
     const shadowed: SkillEntry[] = []
     for (const root of this.scanRoots(cwd)) {
@@ -158,7 +289,12 @@ export class SkillCatalog {
         const winnerRank = winner.rank
         if (winnerRank === undefined || root.rank <= winnerRank) {
           // 文件来源优先级不高于生效版本（或生效来源未知）：不判遮蔽。
-          warnings.push(`文件来源 ${parsed.name}（${root.source}）与生效版本（${winner.summary.source}）的优先级关系无法确认，未判遮蔽`)
+          warn(
+            warnings,
+            'skills.priorityUnconfirmed',
+            { name: parsed.name, source: root.source, winnerSource: winner.summary.source },
+            `文件来源 ${parsed.name}（${root.source}）与生效版本（${winner.summary.source}）的优先级关系无法确认，未判遮蔽`,
+          )
           continue
         }
         shadowed.push({
@@ -205,19 +341,24 @@ export class SkillCatalog {
    * 读取并解析一个指令文件。文件缺失 → undefined（静默，目录包未完成
    * 属正常）；其余读取失败 → 单条 warning；解析失败 → 单条 warning。
    */
-  private async readSkillFile(path: string, warnings: string[]): Promise<ParsedSkill | undefined> {
+  private async readSkillFile(path: string, warnings: WarningLog): Promise<ParsedSkill | undefined> {
     let raw: string
     try {
       raw = await readFile(path, 'utf8')
     } catch (error) {
       const code = (error as NodeJS.ErrnoException | undefined)?.code
       if (code === 'ENOENT') return undefined
-      warnings.push(`skill 文件 ${path} 读取失败：${errorMessage(error)}`)
+      warn(
+        warnings,
+        'skills.fileReadFailed',
+        { path, message: errorMessage(error) },
+        `skill 文件 ${path} 读取失败：${errorMessage(error)}`,
+      )
       return undefined
     }
     const parsed = parseSkillFrontmatter(raw)
     if (!parsed.ok) {
-      warnings.push(`skill 文件 ${path} 被忽略：${parsed.reason}`)
+      warn(warnings, 'skills.fileIgnored', { path, reason: parsed.reason }, `skill 文件 ${path} 被忽略：${parsed.reason}`)
       return parsed
     }
     return parsed
@@ -225,14 +366,19 @@ export class SkillCatalog {
 }
 
 /** 列举一个扫描根的候选文件：`<root>/<name>/SKILL.md` 与 `<root>/<name>.md`。 */
-async function listRootCandidateFiles(root: ScanRoot, warnings: string[]): Promise<string[]> {
+async function listRootCandidateFiles(root: ScanRoot, warnings: WarningLog): Promise<string[]> {
   let dirents
   try {
     dirents = await readdir(root.path, { withFileTypes: true })
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | undefined)?.code
     if (code === 'ENOENT') return []
-    warnings.push(`skill 根目录 ${root.path} 读取失败：${errorMessage(error)}`)
+    warn(
+      warnings,
+      'skills.rootReadFailed',
+      { path: root.path, message: errorMessage(error) },
+      `skill 根目录 ${root.path} 读取失败：${errorMessage(error)}`,
+    )
     return []
   }
   const paths: string[] = []

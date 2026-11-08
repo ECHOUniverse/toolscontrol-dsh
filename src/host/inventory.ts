@@ -10,6 +10,7 @@ import { PLUGIN_NAME, PLUGIN_VERSION, type McpProbeResponse, type McpSnapshot, t
 import { errorMessage } from './services.ts'
 import type { McpCatalog } from './mcp.ts'
 import type { SkillCatalog } from './skills.ts'
+import { warn, warningLog } from './warnings.ts'
 
 /** 只读总览服务。 */
 export class OverviewService {
@@ -23,10 +24,12 @@ export class OverviewService {
 
   /**
    * 当前总览快照。两个纵切并发聚合；`Promise.allSettled` 保证单侧
-   * 失败时另一侧照常返回。
+   * 失败时另一侧照常返回。`sessionId` 让 Skills 按该会话的 preset
+   * scope 读取官方注册表（不能只用 cwd：当前 DSH 的 skill-filesystem
+   * 注册在会话 preset 层）。
    */
-  async snapshot(cwd?: string): Promise<OverviewSnapshot> {
-    const [mcpOutcome, skillsOutcome] = await Promise.allSettled([this.mcp.snapshot(), this.skills.snapshot(cwd)])
+  async snapshot(cwd?: string, sessionId?: string): Promise<OverviewSnapshot> {
+    const [mcpOutcome, skillsOutcome] = await Promise.allSettled([this.mcp.snapshot(), this.skills.snapshot(cwd, sessionId)])
     return {
       plugin: PLUGIN_NAME,
       version: PLUGIN_VERSION,
@@ -44,19 +47,25 @@ export class OverviewService {
 
 /** MCP 纵切聚合失败的统一降级快照。 */
 function degradedMcpSnapshot(reason: unknown): McpSnapshot {
+  const warnings = warningLog()
+  warn(warnings, 'mcp.aggregateFailed', { message: errorMessage(reason) }, `MCP 聚合失败：${errorMessage(reason)}`)
   return {
     mode: 'unavailable',
     capabilities: { connectionStatus: false, toolCount: false, probe: false },
     servers: [],
-    warnings: [`MCP 聚合失败：${errorMessage(reason)}`],
+    warnings: warnings.warnings,
+    warningItems: warnings.warningItems,
   }
 }
 
 /** Skills 纵切聚合失败的统一降级快照。 */
 function degradedSkillsSnapshot(cwd: string | undefined, reason: unknown): SkillsSnapshot {
+  const warnings = warningLog()
+  warn(warnings, 'skills.aggregateFailed', { message: errorMessage(reason) }, `Skills 聚合失败：${errorMessage(reason)}`)
   return {
     cwd: cwd ?? null,
     skills: [],
-    warnings: [`Skills 聚合失败：${errorMessage(reason)}`],
+    warnings: warnings.warnings,
+    warningItems: warnings.warningItems,
   }
 }

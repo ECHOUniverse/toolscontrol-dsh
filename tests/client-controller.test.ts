@@ -59,8 +59,8 @@ function snapshotOf(cwd: string | null, overrides: Partial<OverviewSnapshot> = {
       mode: 'config',
       capabilities: { connectionStatus: false, toolCount: false, probe: false },
       servers: [
-        { name: 'siyuan', enabled: true, configured: true, status: 'unknown', source: 'unknown' },
-        { name: 'zotero', enabled: false, configured: true, status: 'unknown', source: 'unknown' },
+        { name: 'siyuan', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'profile' },
+        { name: 'zotero', enabled: false, configured: true, status: 'unknown', source: 'unknown', scope: 'profile' },
       ],
       warnings: [],
     },
@@ -90,15 +90,16 @@ function snapshotOf(cwd: string | null, overrides: Partial<OverviewSnapshot> = {
 
 interface FetchCall {
   cwd: string | undefined
+  sessionId: string | undefined
   signal: AbortSignal
 }
 
-/** 受控 fetchOverview：每次调用记录 (cwd, signal)，返回外部可结算的 promise。 */
+/** 受控 fetchOverview：每次调用记录 (cwd, sessionId, signal)，返回外部可结算的 promise。 */
 function fakeFetch() {
   const calls: FetchCall[] = []
   const pending: { resolve: (value: OverviewSnapshot) => void; reject: (reason: unknown) => void }[] = []
-  const fn = (args: { cwd?: string; signal: AbortSignal }): Promise<OverviewSnapshot> => {
-    calls.push({ cwd: args.cwd, signal: args.signal })
+  const fn = (args: { cwd?: string; sessionId?: string; signal: AbortSignal }): Promise<OverviewSnapshot> => {
+    calls.push({ cwd: args.cwd, sessionId: args.sessionId, signal: args.signal })
     const gate = deferred<OverviewSnapshot>()
     pending.push(gate)
     return gate.promise
@@ -219,6 +220,29 @@ describe('工作区跟踪与切换竞态（slice 4b）', () => {
     expect(state.status).toBe('ready')
     expect(state.workspace).toEqual(NO_WORKSPACE)
     expect(state.lastRefreshedAt).toBe(1_000)
+  })
+
+  it('主 Session 决定 sessionId 并随请求发送；同一 cwd 切换到另一 Session 也重新获取', async () => {
+    const { controller, fetch, sessions } = controllerWith()
+    controller.ensure()
+    expect(fetch.calls[0]!.sessionId).toBeUndefined()
+
+    sessions.set({
+      ids: ['a'],
+      byId: { a: { id: 'a', cwd: '/home/me/proj-a', retainedBy: { mainView: 1 } } },
+      phase: 'ready',
+    })
+    expect(fetch.calls).toHaveLength(2)
+    expect(fetch.calls[1]).toMatchObject({ cwd: '/home/me/proj-a', sessionId: 'a' })
+
+    // 同一 cwd 下切换主 Session：会话级 preset scope 可能不同，必须重新获取。
+    sessions.set({
+      ids: ['b'],
+      byId: { b: { id: 'b', cwd: '/home/me/proj-a', retainedBy: { mainView: 1 } } },
+      phase: 'ready',
+    })
+    expect(fetch.calls).toHaveLength(3)
+    expect(fetch.calls[2]).toMatchObject({ cwd: '/home/me/proj-a', sessionId: 'b' })
   })
 
   it('重入（再次 ensure，重新进入标签页）重新获取快照，且 store 只挂载一次', async () => {
@@ -372,7 +396,7 @@ describe('刷新保留旧数据（slice 5a）', () => {
       mcp: {
         mode: 'managed',
         capabilities: { connectionStatus: true, toolCount: true, probe: true },
-        servers: [{ name: 'siyuan', enabled: true, configured: true, status: 'connected', source: 'unknown', toolCount: 1 }],
+        servers: [{ name: 'siyuan', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown', toolCount: 1 }],
         warnings: [],
       },
     })
@@ -430,7 +454,7 @@ describe('probe 门控（slice 5b）', () => {
       mcp: {
         mode: 'managed',
         capabilities: { connectionStatus: true, toolCount: true, probe: true },
-        servers: [{ name: 'siyuan', enabled: true, configured: true, status: 'connected', source: 'unknown', toolCount: 2 }],
+        servers: [{ name: 'siyuan', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown', toolCount: 2 }],
         warnings: [],
       },
     })
@@ -465,7 +489,7 @@ describe('probe 门控（slice 5b）', () => {
       mcp: {
         mode: 'managed',
         capabilities: { connectionStatus: true, toolCount: true, probe: true },
-        servers: [{ name: 'siyuan', enabled: true, configured: true, status: 'connected', source: 'unknown' }],
+        servers: [{ name: 'siyuan', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' }],
         warnings: [],
       },
     })
@@ -508,8 +532,8 @@ describe('probe 门控（slice 5b）', () => {
         mode: 'managed',
         capabilities: { connectionStatus: true, toolCount: true, probe: true },
         servers: [
-          { name: 'alpha', enabled: true, configured: true, status: 'connected', source: 'unknown' },
-          { name: 'beta', enabled: true, configured: true, status: 'connected', source: 'unknown' },
+          { name: 'alpha', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
+          { name: 'beta', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
         ],
         warnings: [],
       },
@@ -558,8 +582,8 @@ describe('probe 门控（slice 5b）', () => {
         mode: 'managed',
         capabilities: { connectionStatus: true, toolCount: true, probe: true },
         servers: [
-          { name: 'alpha', enabled: true, configured: true, status: 'connected', source: 'unknown' },
-          { name: 'beta', enabled: true, configured: true, status: 'connected', source: 'unknown' },
+          { name: 'alpha', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
+          { name: 'beta', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
         ],
         warnings: [],
       },

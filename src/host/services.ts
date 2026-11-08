@@ -60,8 +60,47 @@ export interface PluginInventoryEntryFace {
   enabled: boolean
 }
 
+/**
+ * One row of an agent-preset composition, as `pluginInventory.list()`
+ * projects it (`AgentPresetCompositionRow` with the fiber state swapped for
+ * `fiberPhase`). `entryId` is `string | null` in the official type — preset
+ * rows are declared in YAML and need not have a Loader entry id.
+ * `enabled` is `CompositionRowEnablement` (`boolean | 'conditional'`): a row
+ * whose `disabled` is a JsExpr cannot be resolved statically.
+ */
+export interface PluginInventoryPresetRowFace {
+  entryId: string | null
+  moduleName: string
+  enabled: boolean | 'conditional'
+}
+
+/**
+ * One composed agent-preset roster entry (`AgentPresetComposition` subset).
+ * `broken` is the official activation diagnostic; its rows are still the
+ * declared composition.
+ */
+export interface PluginInventoryPresetFace {
+  id: string
+  name?: string
+  isDefault?: boolean
+  broken?: string
+  rows: readonly PluginInventoryPresetRowFace[]
+}
+
+/**
+ * Official `pluginInventory.list()` result (`readPluginInventory`): the
+ * profile root Loader entries plus, when an agent-preset roster is composed,
+ * each preset's composition rows. Preset rows are where a deployment that
+ * mounts the roster actually runs model-facing plugins — ignoring them hides
+ * every MCP server configured only inside a preset.
+ */
+export interface PluginInventorySnapshotFace {
+  entries: readonly PluginInventoryEntryFace[]
+  agentPresets?: readonly PluginInventoryPresetFace[]
+}
+
 export interface PluginInventoryFace {
-  list(): Promise<{ entries: readonly PluginInventoryEntryFace[] }>
+  list(): Promise<PluginInventorySnapshotFace>
 }
 
 // ---------------------------------------------------------------------------
@@ -124,9 +163,37 @@ export interface SkillSummaryFace {
   provider: string
 }
 
-/** `ctx.skills` 注册表读面（`SkillRegistry.list`；省略 scope 读全局层）。 */
+/**
+ * `ctx.skills` 注册表读面（官方 `SkillRegistry.list` / `SkillViewOptions`）。
+ * `scope` 是会话观看层：官方对 scope 链与全局层做合并；省略即只看全局层。
+ */
 export interface SkillsRegistryFace {
-  list(options?: { cwd?: string }): Promise<readonly SkillSummaryFace[]>
+  list(options?: { cwd?: string; scope?: object }): Promise<readonly SkillSummaryFace[]>
+}
+
+/**
+ * 一个 live Agent 的最小结构面（官方 `ctx.agents.get(sessionId)` 的返回值）。
+ * 同一个对象同时作为 `skills.list({scope})` 的 scope carrier —— 本插件不读
+ * Agent 的其它字段；`ctx` 仅供官方 `agentPresets.serviceFor` 定位 preset
+ * 组合，插件自身从不检查它。
+ */
+export interface AgentFace {
+  readonly id: string
+  readonly ctx?: unknown
+}
+
+/** `ctx.agents` 读面：按 SessionId 查找 live Agent。 */
+export interface AgentsFace {
+  get(id: string): AgentFace | undefined
+}
+
+/**
+ * `ctx.agentPresets` 读面：解析 live Agent 所在 preset 组合内挂载的
+ * `skills` 服务。preset 可以隔离出自己的 skills registry，因此官方
+ * session catalog 优先用它，找不到才回退宿主 `ctx.skills`。
+ */
+export interface AgentPresetsFace {
+  serviceFor(agent: AgentFace, name: 'skills'): SkillsRegistryFace | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +207,8 @@ export interface HostServices {
   pluginInventory?: PluginInventoryFace
   mcpManager?: McpManagerFace
   skills?: SkillsRegistryFace
+  agents?: AgentsFace
+  agentPresets?: AgentPresetsFace
 }
 
 /** Read the plugin-facing services off a Cordis host context, defensively. */
@@ -155,6 +224,8 @@ export function servicesOf(ctx: unknown): HostServices {
     pluginInventory: face<PluginInventoryFace>('pluginInventory'),
     mcpManager: face<McpManagerFace>('mcpManager'),
     skills: face<SkillsRegistryFace>('skills'),
+    agents: face<AgentsFace>('agents'),
+    agentPresets: face<AgentPresetsFace>('agentPresets'),
   }
 }
 

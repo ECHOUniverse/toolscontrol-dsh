@@ -15,7 +15,8 @@
  * @module @hanxu131/toolscontrol-dsh/client/view-model
  */
 
-import type { McpServerEntry, SkillEntry } from '../shared/protocol.ts'
+import type { McpServerEntry, McpSnapshot, SkillEntry } from '../shared/protocol.ts'
+import type { WorkspaceContext } from './workspace.ts'
 
 // ---------------------------------------------------------------------------
 // Collator (slice: stable ordering by the active UI language)
@@ -74,6 +75,54 @@ export function mcpStatusOptions(servers: readonly McpServerEntry[], collator: I
   const seen = new Set<string>()
   for (const server of servers) seen.add(server.status)
   return [...seen].sort((left, right) => collator.compare(left, right))
+}
+
+/**
+ * Empty-state message key of the MCP tab.
+ *
+ * A readable snapshot with zero servers means "the DSH profile root and its
+ * composed presets declare no MCP server" — it must never read as "no MCP
+ * anywhere", and it must not imply that external CLI configuration
+ * (`~/.cursor`, `~/.kimi-code`, …) was read: this plugin only reads DSH's own
+ * composition.
+ *
+ * That conclusion is only allowed when the snapshot explicitly says BOTH
+ * composition surfaces were read completely (`mode === 'config'` with
+ * `canAssertEmpty === true`). A partial read, an unavailable source, or the
+ * managed mode (which governs only the global plane) cannot assert it, so the
+ * neutral message is used and the warnings explain why. The test is on the
+ * explicit capability flag, never on warning text.
+ */
+export function mcpEmptyStateKey(mcp: McpSnapshot | undefined): string {
+  if (mcp === undefined || mcp.mode !== 'config' || mcp.canAssertEmpty !== true) return 'state.emptyAll'
+  return 'mcp.emptyAll'
+}
+
+// ---------------------------------------------------------------------------
+// Skills scope line (session scope vs. workspace directory)
+// ---------------------------------------------------------------------------
+
+/**
+ * The Skills tab's top scope line. It distinguishes three genuinely different
+ * situations that must never share copy:
+ * - a workspace/title is known → show it;
+ * - a main session is known but its cwd is not → session preset scope applies,
+ *   the project directory is unknown (must NOT read as "global skills");
+ * - neither is known → global view with an unknown project directory.
+ */
+export type SkillsScopeLine =
+  | { key: 'workspace.title'; title: string }
+  | { key: 'workspace.sessionNoCwd'; sessionId: string }
+  | { key: 'workspace.none' }
+
+/** Resolve the Skills scope line from the published workspace context. */
+export function skillsScopeLine(workspace: WorkspaceContext): SkillsScopeLine {
+  const title = workspace.workspaceTitle ?? workspace.cwd
+  if (title !== null && title !== undefined && title !== '') return { key: 'workspace.title', title }
+  if (workspace.sessionId !== null && workspace.sessionId !== '') {
+    return { key: 'workspace.sessionNoCwd', sessionId: workspace.sessionId }
+  }
+  return { key: 'workspace.none' }
 }
 
 // ---------------------------------------------------------------------------

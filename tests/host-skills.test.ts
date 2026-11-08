@@ -92,6 +92,20 @@ describe('Skills 生效项聚合（官方注册表）', () => {
     expect(snap.skills).toEqual([])
     expect(snap.warnings.join('\n')).toMatch(/catalog boom/)
   })
+
+  it('warnings 与 warningItems 同序：raw 保回退、code 可本地化', async () => {
+    const missing = await new SkillCatalog().snapshot()
+    expect(missing.warningItems).toHaveLength(missing.warnings.length)
+    expect(missing.warningItems?.map((item) => item.code)).toEqual(['skills.unavailable'])
+
+    const { registry } = registryOf([EFFECTIVE[0]!])
+    const snap = await new SkillCatalog({
+      registry,
+      roots: { dshHome: '/nonexistent-toolscontrol/dsh', agentsHome: '/nonexistent-toolscontrol/agents' },
+    }).snapshot()
+    expect(snap.warningItems).toHaveLength(snap.warnings.length)
+    expect(snap.warningItems?.[0]?.code).toBe('skills.shadowedIncomplete')
+  })
 })
 
 // ---------------------------------------------------------------------------

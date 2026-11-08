@@ -12,10 +12,13 @@ import {
   filterMcpServers,
   filterSkillRows,
   groupSkills,
+  mcpEmptyStateKey,
   mcpStatusOptions,
   skillSourceOptions,
+  skillsScopeLine,
 } from '../src/client/view-model.ts'
-import type { McpServerEntry, SkillEntry } from '../src/shared/protocol.ts'
+import { en, zh } from '../src/client/i18n.ts'
+import type { McpServerEntry, McpSnapshot, SkillEntry } from '../src/shared/protocol.ts'
 
 /** rc.5 降级形态：连接状态恒 unknown、无工具数量。 */
 function entry(overrides: Partial<McpServerEntry> & { name: string }): McpServerEntry {
@@ -24,6 +27,7 @@ function entry(overrides: Partial<McpServerEntry> & { name: string }): McpServer
     configured: true,
     status: 'unknown',
     source: 'unknown',
+    scope: 'profile',
     ...overrides,
   }
 }
@@ -162,6 +166,85 @@ describe('Skills 分组（slice 2）', () => {
       skill({ name: 'ghost', source: 'runtime', visibility: 'shadowed' }),
     ])
     expect(skillSourceOptions(rows, COLLATOR)).toEqual(['bundled', 'project-dsh', 'runtime'])
+  })
+})
+
+describe('MCP 空态文案（不得让"没有条目"暗示"DSH 没有 MCP server"）', () => {
+  const CAPS = { connectionStatus: false, toolCount: false, probe: false }
+  function snapshot(overrides: Partial<McpSnapshot> = {}): McpSnapshot {
+    return { mode: 'config', capabilities: CAPS, servers: [], warnings: [], ...overrides }
+  }
+
+  it('完整读取的 config 空清单 → 专用诚实空态（说明统计范围是 DSH profile/presets）', () => {
+    expect(mcpEmptyStateKey(snapshot({ canAssertEmpty: true }))).toBe('mcp.emptyAll')
+    // 判断依据是显式能力标志，不是 warning 文案：有 warning 但读取完整仍可断言。
+    expect(mcpEmptyStateKey(snapshot({ canAssertEmpty: true, warnings: ['duplicate rows ignored'] }))).toBe(
+      'mcp.emptyAll',
+    )
+  })
+
+  it('config 但读取不完整（canAssertEmpty 缺失或 false）→ 通用空态：不能断言"未配置"', () => {
+    expect(mcpEmptyStateKey(snapshot())).toBe('state.emptyAll')
+    expect(mcpEmptyStateKey(snapshot({ canAssertEmpty: false, warnings: ['entries unavailable'] }))).toBe(
+      'state.emptyAll',
+    )
+  })
+
+  it('managed 零条目 → 通用空态：托管来源同样不得断言"未配置"', () => {
+    expect(mcpEmptyStateKey(snapshot({ mode: 'managed' }))).toBe('state.emptyAll')
+    expect(mcpEmptyStateKey(snapshot({ mode: 'managed', canAssertEmpty: true }))).toBe('state.emptyAll')
+  })
+
+  it('unavailable 模式 → 通用空态：服务不可用时不能断言"未配置"', () => {
+    expect(mcpEmptyStateKey(snapshot({ mode: 'unavailable' }))).toBe('state.emptyAll')
+    expect(mcpEmptyStateKey(undefined)).toBe('state.emptyAll')
+  })
+
+  it('中英文空态文案明确声明只统计 DSH 内部来源、未读取外部 CLI 配置', () => {
+    for (const text of [zh['mcp.emptyAll'], en['mcp.emptyAll']]) {
+      expect(text).toContain('DSH')
+      expect(text.toLowerCase()).toContain('preset')
+    }
+    expect(zh['mcp.emptyAll']).toMatch(/未读取外部 CLI 配置/)
+    expect(en['mcp.emptyAll']).toMatch(/external CLI config/)
+  })
+})
+
+describe('Skills 顶部范围文案（会话 scope / 目录未知）', () => {
+  it('有工作区标题时显示工作区', () => {
+    expect(skillsScopeLine({ sessionId: 's1', cwd: '/proj', workspaceTitle: 'Demo' })).toEqual({
+      key: 'workspace.title',
+      title: 'Demo',
+    })
+  })
+
+  it('有 cwd 但无标题时以 cwd 作为工作区标题', () => {
+    expect(skillsScopeLine({ sessionId: 's1', cwd: '/proj', workspaceTitle: null })).toEqual({
+      key: 'workspace.title',
+      title: '/proj',
+    })
+  })
+
+  it('有主会话但无 cwd → 会话 preset 范围文案，不显示"全局 Skills"', () => {
+    expect(skillsScopeLine({ sessionId: 's1', cwd: null, workspaceTitle: null })).toEqual({
+      key: 'workspace.sessionNoCwd',
+      sessionId: 's1',
+    })
+  })
+
+  it('无会话且无目录 → 全局/未选中工作区文案', () => {
+    expect(skillsScopeLine({ sessionId: null, cwd: null, workspaceTitle: null })).toEqual({ key: 'workspace.none' })
+  })
+
+  it('中英文会话范围文案说明 preset scope 与目录未知，且不冒充全局 Skills', () => {
+    expect(zh['workspace.sessionNoCwd']).toContain('{sessionId}')
+    expect(zh['workspace.sessionNoCwd']).toMatch(/preset/)
+    expect(zh['workspace.sessionNoCwd']).toMatch(/目录未知/)
+    expect(zh['workspace.sessionNoCwd']).not.toMatch(/全局/)
+    expect(en['workspace.sessionNoCwd']).toContain('{sessionId}')
+    expect(en['workspace.sessionNoCwd']).toMatch(/preset scope/)
+    expect(en['workspace.sessionNoCwd']).toMatch(/directory is unknown/)
+    expect(en['workspace.sessionNoCwd']).not.toMatch(/global/i)
   })
 })
 

@@ -39,13 +39,25 @@ const MCP_ENTRY: PluginInventoryEntryFace = {
   enabled: true,
 }
 
+/**
+ * 官方 `pluginInventory.list()` 的完整返回形状夹具：`entries`（profile
+ * 根级非 group 条目）+ 可选的 `agentPresets[]`（每个 preset 的组合行）。
+ * 形状核实自 dsh-host-plugin-inventory `readPluginInventory` 与
+ * `agentPresets.compositionInventory()` 的 `AgentPresetComposition`。
+ */
+function rawInventoryOf(snapshot: { entries?: readonly unknown[]; agentPresets?: unknown }): PluginInventoryFace {
+  return {
+    list: async () => snapshot as unknown as { entries: readonly PluginInventoryEntryFace[] },
+  }
+}
+
 describe('MCP 配置层聚合（rc.5 pluginInventory 降级）', () => {
   it('把 mcp-client 配置条目聚合成服务器条目，来源保守标未知', async () => {
     const catalog = new McpCatalog({ inventory: inventoryOf([MCP_ENTRY]) })
     const snap = await catalog.snapshot()
     expect(snap.mode).toBe('config')
     expect(snap.servers).toEqual([
-      { name: 'mcp.notes', enabled: true, configured: true, status: 'unknown', source: 'unknown' },
+      { name: 'mcp.notes', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'profile' },
     ])
   })
 
@@ -110,7 +122,7 @@ describe('MCP 配置层聚合（rc.5 pluginInventory 降级）', () => {
     expect(text).not.toContain('127.0.0.1:9999')
     // 字段白名单：服务器条目只允许聚合语义字段
     for (const server of snap.servers) {
-      expect(Object.keys(server).sort()).toEqual(['configured', 'enabled', 'name', 'source', 'status'])
+      expect(Object.keys(server).sort()).toEqual(['configured', 'enabled', 'name', 'scope', 'source', 'status'])
     }
   })
 
@@ -130,6 +142,289 @@ describe('MCP 配置层聚合（rc.5 pluginInventory 降级）', () => {
     expect(snap.mode).toBe('unavailable')
     expect(snap.servers).toEqual([])
     expect(snap.warnings.join('\n')).toMatch(/loader unavailable/)
+  })
+
+  it('warnings 与 warningItems 同序：降级/畸形数据都有结构化 code', async () => {
+    const unavailable = await new McpCatalog({}).snapshot()
+    expect(unavailable.warningItems).toHaveLength(unavailable.warnings.length)
+    expect(unavailable.warningItems?.map((item) => item.code)).toEqual(['mcp.inventoryUnavailable'])
+
+    const catalog = new McpCatalog({
+      inventory: rawInventoryOf({
+        entries: [
+          MCP_ENTRY,
+          MCP_ENTRY,
+          { entryId: 'bad', moduleName: '@deepseek-ai/dsh-mcp-client', enabled: 'maybe' },
+        ],
+        agentPresets: 'broken',
+      }),
+    })
+    const snap = await catalog.snapshot()
+    expect(snap.warningItems).toHaveLength(snap.warnings.length)
+    expect(snap.warningItems?.map((item) => item.code)).toEqual([
+      'mcp.presetsUnparsable',
+      'mcp.invalidEnabledRows',
+      'mcp.duplicates',
+    ])
+  })
+})
+
+describe('MCP preset 组合聚合（agentPresets[].rows）', () => {
+  const PTC_ROWS = [
+    { entryId: 'preset.mcp.notes', moduleName: '@deepseek-ai/dsh-mcp-client', enabled: true },
+    { entryId: 'preset.ui-chat', moduleName: '@deepseek-ai/dsh-client-ui-chat', enabled: true },
+  ]
+
+  it('profile 根级没有 MCP 时仍聚合 preset 行，并标注 preset 作用域（不冒充全局）', async () => {
+    const catalog = new McpCatalog({
+      inventory: rawInventoryOf({
+        entries: [{ entryId: 'ui-chat', moduleName: '@deepseek-ai/dsh-client-ui-chat', enabled: true }],
+        agentPresets: [{ id: 'ptc', name: 'PTC', isDefault: true, rows: PTC_ROWS }],
+      }),
+    })
+    const snap = await catalog.snapshot()
+    expect(snap.mode).toBe('config')
+    expect(snap.servers).toEqual([
+      {
+        name: 'preset.mcp.notes',
+        enabled: true,
+        configured: true,
+        status: 'unknown',
+        source: 'unknown',
+        scope: 'preset',
+        preset: { id: 'ptc', name: 'PTC' },
+      },
+    ])
+  })
+
+  it('root 与 preset 出现同名条目时都保留：作用域不同，绝不合并成一个全局项', async () => {
+    const catalog = new McpCatalog({
+      inventory: rawInventoryOf({
+        entries: [MCP_ENTRY],
+        agentPresets: [{ id: 'ptc', rows: [{ entryId: 'mcp.notes', moduleName: 'mcp-client', enabled: false }] }],
+      }),
+    })
+    const snap = await catalog.snapshot()
+    expect(snap.servers.map((server) => ({ scope: server.scope, name: server.name, enabled: server.enabled }))).toEqual([
+      { scope: 'profile', name: 'mcp.notes', enabled: true },
+      { scope: 'preset', name: 'mcp.notes', enabled: false },
+    ])
+    // 无 name 的 preset 只有 id
+    expect(snap.servers[1]!.preset).toEqual({ id: 'ptc' })
+  })
+
+  it('preset 行没有 entryId 时回退 moduleName 作为名称（官方类型 entryId: string | null）', async () => {
+    const catalog = new McpCatalog({
+      inventory: rawInventoryOf({
+        agentPresets: [{ id: 'standard', rows: [{ entryId: null, moduleName: '@deepseek-ai/dsh-mcp-client', enabled: true }] }],
+      }),
+    })
+    const snap = await catalog.snapshot()
+    expect(snap.servers).toEqual([
+      {
+        name: '@deepseek-ai/dsh-mcp-client',
+        enabled: true,
+        configured: true,
+        status: 'unknown',
+        source: 'unknown',
+        scope: 'preset',
+        preset: { id: 'standard' },
+      },
+    ])
+  })
+
+  it('同一作用域内的重复条目去重并给出 warning（保留首条；跨作用域不算重复）', async () => {
+    const catalog = new McpCatalog({
+      inventory: rawInventoryOf({
+        entries: [MCP_ENTRY, { entryId: 'mcp.notes', moduleName: 'mcp-client', enabled: false }],
+        agentPresets: [
+          {
+            id: 'ptc',
+            rows: [
+              { entryId: 'dup', moduleName: '@deepseek-ai/dsh-mcp-client', enabled: true },
+              { entryId: 'dup', moduleName: '@deepseek-ai/dsh-mcp-client', enabled: false },
+            ],
+          },
+        ],
+      }),
+    })
+    const snap = await catalog.snapshot()
+    expect(snap.servers.map((server) => `${server.scope}:${server.name}:${server.enabled}`)).toEqual([
+      'profile:mcp.notes:true',
+      'preset:dup:true',
+    ])
+    expect(snap.warnings.join('\n')).toMatch(/重复/)
+    expect(snap.warnings.join('\n')).toMatch(/2/)
+  })
+
+  it('preset 的条件启用（disabled 为表达式）显式标注 conditional，不假装已静态启用', async () => {
+    const catalog = new McpCatalog({
+      inventory: rawInventoryOf({
+        agentPresets: [
+          {
+            id: 'ptc',
+            rows: [{ entryId: 'maybe', moduleName: '@deepseek-ai/dsh-mcp-client', enabled: 'conditional' }],
+          },
+        ],
+      }),
+    })
+    const snap = await catalog.snapshot()
+    expect(snap.servers).toEqual([
+      expect.objectContaining({ name: 'maybe', enabled: true, conditional: true, scope: 'preset' }),
+    ])
+  })
+
+  it('agentPresets 畸形时降级为仅 root 并携带 warning，快照不失败', async () => {
+    const catalog = new McpCatalog({
+      inventory: rawInventoryOf({ entries: [MCP_ENTRY], agentPresets: 'not-an-array' }),
+    })
+    const snap = await catalog.snapshot()
+    expect(snap.mode).toBe('config')
+    expect(snap.servers.map((server) => server.name)).toEqual(['mcp.notes'])
+    expect(snap.warnings.join('\n')).toMatch(/agentPresets/)
+  })
+
+  it('单个 preset 畸形（缺 id / rows 非数组 / 非对象）时跳过它并 warning，其余 preset 照常聚合', async () => {
+    const catalog = new McpCatalog({
+      inventory: rawInventoryOf({
+        entries: [],
+        agentPresets: [
+          { name: 'no-id', rows: [{ entryId: 'x', moduleName: '@deepseek-ai/dsh-mcp-client', enabled: true }] },
+          { id: 'bad-rows', rows: 'nope' },
+          null,
+          { id: 'good', rows: [{ entryId: 'ok', moduleName: '@deepseek-ai/dsh-mcp-client', enabled: true }] },
+        ],
+      }),
+    })
+    const snap = await catalog.snapshot()
+    expect(snap.servers.map((server) => `${server.preset?.id}:${server.name}`)).toEqual(['good:ok'])
+    expect(snap.warnings.join('\n')).toMatch(/preset/)
+  })
+
+  it('preset 标记 broken 时仍展示其声明行，并 warning 说明可能不完整', async () => {
+    const catalog = new McpCatalog({
+      inventory: rawInventoryOf({
+        agentPresets: [
+          {
+            id: 'broken',
+            name: 'Broken',
+            broken: 'activation failed',
+            rows: [{ entryId: 'b1', moduleName: '@deepseek-ai/dsh-mcp-client', enabled: true }],
+          },
+        ],
+      }),
+    })
+    const snap = await catalog.snapshot()
+    expect(snap.servers.map((server) => server.name)).toEqual(['b1'])
+    expect(snap.warnings.join('\n')).toMatch(/Broken/)
+  })
+
+  it('preset 行为空或全部为非 MCP 模块时不产生条目（不伪造条目）', async () => {
+    const catalog = new McpCatalog({
+      inventory: rawInventoryOf({
+        agentPresets: [
+          { id: 'empty', rows: [] },
+          { id: 'ui-only', rows: [{ entryId: 'u', moduleName: '@deepseek-ai/dsh-client-ui-chat', enabled: true }] },
+        ],
+      }),
+    })
+    const snap = await catalog.snapshot()
+    expect(snap.mode).toBe('config')
+    expect(snap.servers).toEqual([])
+  })
+})
+
+describe('MCP 空态可断言能力（canAssertEmpty，仅完整读取两个组装面）', () => {
+  it('完整读取 entries 与 agentPresets 的空 config → canAssertEmpty=true', async () => {
+    const snap = await new McpCatalog({ inventory: rawInventoryOf({ entries: [], agentPresets: [] }) }).snapshot()
+    expect(snap.mode).toBe('config')
+    expect(snap.servers).toEqual([])
+    expect(snap.canAssertEmpty).toBe(true)
+  })
+
+  it('完整读取且有条目时同样标记可断言（不因非空而失真）', async () => {
+    const snap = await new McpCatalog({ inventory: inventoryOf([MCP_ENTRY]) }).snapshot()
+    expect(snap.canAssertEmpty).toBe(true)
+  })
+
+  it('entries 不可解析 → canAssertEmpty=false，套用通用空态而非“未配置”', async () => {
+    const snap = await new McpCatalog({ inventory: rawInventoryOf({ entries: 'not-an-array' }) }).snapshot()
+    expect(snap.mode).toBe('config')
+    expect(snap.servers).toEqual([])
+    expect(snap.canAssertEmpty).toBe(false)
+    expect(snap.warnings.join('\n')).toMatch(/entries/)
+  })
+
+  it('agentPresets 不可解析 → canAssertEmpty=false', async () => {
+    const snap = await new McpCatalog({
+      inventory: rawInventoryOf({ entries: [], agentPresets: 'not-an-array' }),
+    }).snapshot()
+    expect(snap.servers).toEqual([])
+    expect(snap.canAssertEmpty).toBe(false)
+  })
+
+  it('preset rows 不可解析（缺 id / rows 非数组 / 非对象）→ canAssertEmpty=false', async () => {
+    const snap = await new McpCatalog({
+      inventory: rawInventoryOf({
+        entries: [],
+        agentPresets: [{ name: 'no-id', rows: [] }, { id: 'bad-rows', rows: 'nope' }, null],
+      }),
+    }).snapshot()
+    expect(snap.servers).toEqual([])
+    expect(snap.canAssertEmpty).toBe(false)
+  })
+
+  it('无法解析的条目行 → canAssertEmpty=false', async () => {
+    const snap = await new McpCatalog({
+      inventory: rawInventoryOf({ entries: [MCP_ENTRY, null] }),
+    }).snapshot()
+    expect(snap.servers.map((server) => server.name)).toEqual(['mcp.notes'])
+    expect(snap.canAssertEmpty).toBe(false)
+  })
+
+  it('MCP 条目 enabled 缺失/非 boolean/conditional → 跳过并 warning，canAssertEmpty=false', async () => {
+    const snap = await new McpCatalog({
+      inventory: rawInventoryOf({
+        entries: [
+          { entryId: 'good', moduleName: '@deepseek-ai/dsh-mcp-client', enabled: true },
+          { entryId: 'missing', moduleName: '@deepseek-ai/dsh-mcp-client' },
+          { entryId: 'text', moduleName: '@deepseek-ai/dsh-mcp-client', enabled: 'yes' },
+          { entryId: 'nullish', moduleName: 'mcp-client', enabled: null },
+        ],
+      }),
+    }).snapshot()
+    expect(snap.servers.map((server) => server.name)).toEqual(['good'])
+    expect(snap.warnings.join('\n')).toMatch(/enabled/)
+    expect(snap.canAssertEmpty).toBe(false)
+  })
+
+  it('重复条目 warning 不代表读取不完整 → canAssertEmpty 仍为 true', async () => {
+    const snap = await new McpCatalog({
+      inventory: rawInventoryOf({
+        entries: [
+          MCP_ENTRY,
+          { entryId: 'mcp.notes', moduleName: '@deepseek-ai/dsh-mcp-client', enabled: false },
+        ],
+      }),
+    }).snapshot()
+    expect(snap.warnings.join('\n')).toMatch(/重复/)
+    expect(snap.canAssertEmpty).toBe(true)
+  })
+
+  it('manager 读取失败回退 config 时，另一来源不完整 → canAssertEmpty=false', async () => {
+    const snap = await new McpCatalog({
+      manager: { list: async () => { throw new Error('manager crashed') } },
+      inventory: inventoryOf([MCP_ENTRY]),
+    }).snapshot()
+    expect(snap.mode).toBe('config')
+    expect(snap.canAssertEmpty).toBe(false)
+  })
+
+  it('托管模式零条目 → 不提供 canAssertEmpty（托管来源不得断言“未配置”）', async () => {
+    const snap = await new McpCatalog({ manager: managerOf([]) }).snapshot()
+    expect(snap.mode).toBe('managed')
+    expect(snap.servers).toEqual([])
+    expect(snap.canAssertEmpty).toBeUndefined()
   })
 })
 
@@ -151,12 +446,12 @@ describe('MCP 托管聚合（官方 mcpManager 晚绑定，未来环境）', () 
     const snap = await catalog.snapshot()
     expect(snap.mode).toBe('managed')
     expect(snap.servers).toEqual([
-      { name: 'notes', enabled: true, configured: true, status: 'connected', toolCount: 7, source: 'unknown' },
-      { name: 'docs', enabled: false, configured: true, status: 'disabled', source: 'unknown' },
-      { name: 'flaky', enabled: true, configured: true, status: 'reconnecting', source: 'unknown' },
-      { name: 'waiting', enabled: true, configured: true, status: 'waiting-credentials', source: 'unknown' },
-      { name: 'gave-up', enabled: true, configured: true, status: 'failed', source: 'unknown' },
-      { name: 'removed', enabled: true, configured: false, status: 'failed', source: 'unknown' },
+      { name: 'notes', enabled: true, configured: true, status: 'connected', toolCount: 7, source: 'unknown', scope: 'unknown' },
+      { name: 'docs', enabled: false, configured: true, status: 'disabled', source: 'unknown', scope: 'unknown' },
+      { name: 'flaky', enabled: true, configured: true, status: 'reconnecting', source: 'unknown', scope: 'unknown' },
+      { name: 'waiting', enabled: true, configured: true, status: 'waiting-credentials', source: 'unknown', scope: 'unknown' },
+      { name: 'gave-up', enabled: true, configured: true, status: 'failed', source: 'unknown', scope: 'unknown' },
+      { name: 'removed', enabled: true, configured: false, status: 'failed', source: 'unknown', scope: 'unknown' },
     ])
   })
 
@@ -195,10 +490,10 @@ describe('MCP 托管聚合（官方 mcpManager 晚绑定，未来环境）', () 
     const snap = await catalog.snapshot()
     expect(snap.mode).toBe('managed')
     expect(snap.servers).toEqual([
-      { name: 'good', enabled: true, configured: true, status: 'connected', toolCount: 1, source: 'unknown' },
-      { name: 'nullish', enabled: true, configured: true, status: 'unknown', source: 'unknown' },
-      { name: 'stateless', enabled: true, configured: true, status: 'unknown', source: 'unknown' },
-      { name: 'weird', enabled: true, configured: true, status: 'unknown', source: 'unknown' },
+      { name: 'good', enabled: true, configured: true, status: 'connected', toolCount: 1, source: 'unknown', scope: 'unknown' },
+      { name: 'nullish', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'unknown' },
+      { name: 'stateless', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'unknown' },
+      { name: 'weird', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'unknown' },
     ])
     for (const broken of ['nullish', 'stateless', 'weird']) {
       expect(snap.warnings.some((warning) => warning.includes(broken))).toBe(true)
@@ -274,9 +569,9 @@ describe('toolCount 有限性', () => {
     })
     const snap = await catalog.snapshot()
     expect(snap.servers).toEqual([
-      { name: 'nan', enabled: true, configured: true, status: 'connected', source: 'unknown' },
-      { name: 'inf', enabled: true, configured: true, status: 'connected', source: 'unknown' },
-      { name: 'ok', enabled: true, configured: true, status: 'connected', toolCount: 3, source: 'unknown' },
+      { name: 'nan', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
+      { name: 'inf', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
+      { name: 'ok', enabled: true, configured: true, status: 'connected', toolCount: 3, source: 'unknown', scope: 'unknown' },
     ])
   })
 })

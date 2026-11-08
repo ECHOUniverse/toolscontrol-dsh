@@ -10,8 +10,11 @@
  * - The main Session's `summary.cwd` is the project-level discovery context;
  *   `workspaces.list` items carry `sessionIds`, which this module uses to
  *   attribute the main Session to a workspace (`workspaceId`/`title`).
- * - No main Session ⇒ cwd is UNKNOWN: the UI must say so and show global
- *   skills — never guess a default directory.
+ * - No main Session ⇒ both `sessionId` and cwd are UNKNOWN: the UI must say
+ *   so and show global skills — never guess a default directory.
+ * - A main Session whose `cwd` is missing ⇒ the session preset scope still
+ *   selects its Skills, but the project directory is UNKNOWN: the UI must say
+ *   that instead of presenting the global view.
  *
  * Structural types only: no released package is imported.
  *
@@ -52,7 +55,11 @@ export interface WorkspacesListShape {
 
 /** Resolved current-workspace context driving the overview `?cwd=` fetch. */
 export interface WorkspaceContext {
-  /** Main (mainView-retained) session id, if any. */
+  /**
+   * Main (mainView-retained) session id, if any. Sent to the host as
+   * `sessionId`: the live session's preset scope selects its Skills (cwd
+   * alone is not enough — skill-filesystem runs in the preset layer).
+   */
   sessionId: string | null
   /** Project-level discovery context for Skills; null when unknown. */
   cwd: string | null

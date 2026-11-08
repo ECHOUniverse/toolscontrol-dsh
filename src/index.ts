@@ -12,10 +12,13 @@
  * 2. `['pluginInventory']` → MCP 配置层条目与可靠启用状态（rc.5 降级路径；
  *    连接状态恒 unknown，绝不读 fiber phase）。
  * 3. `['skills']` → 生效 Skill 枚举（官方注册表；赢家始终为主）。
- * 4. `['mcpManager']` → 未来环境可选挂载：官方 MCP 管理服务存在时提供
+ * 4. `['agents']` + `['agentPresets']` → 把请求的 sessionId 映射到 live
+ *    Agent，并按该会话 preset 的 scope 读取 Skills（官方
+ *    `sessionSkillCatalog` 同源链路；无 live 会话时回退全局 + warning）。
+ * 5. `['mcpManager']` → 未来环境可选挂载：官方 MCP 管理服务存在时提供
  *    真实列表/状态与显式 probe。该服务在 rc.5 不存在——effect 不执行，
  *    结构类型在 host/services.ts 本地声明，不静态依赖任何未发布包。
- * 5. `['webServer', 'connection']` → `/toolscontrol` 只读路由表
+ * 6. `['webServer', 'connection']` → `/toolscontrol` 只读路由表
  *    （health 公开；overview/probe 经官方信任门）。
  *
  * 不做任何写操作：不改 MCP 配置、不写 Skill 文件；快照不携带 env/
@@ -31,7 +34,7 @@ import { McpCatalog } from './host/mcp.ts'
 import { SkillCatalog } from './host/skills.ts'
 import { OverviewService } from './host/inventory.ts'
 import { registerRoutes } from './host/routes.ts'
-import { serviceOf, type ConnectionFace, type HostServices, type McpManagerFace, type PluginInventoryFace, type SkillsRegistryFace, type WebServerFace } from './host/services.ts'
+import { serviceOf, type AgentPresetsFace, type AgentsFace, type ConnectionFace, type HostServices, type McpManagerFace, type PluginInventoryFace, type SkillsRegistryFace, type WebServerFace } from './host/services.ts'
 
 /** Bundle id inside a profile composition. */
 export const name = 'toolscontrol'
@@ -70,6 +73,8 @@ export function createRuntime(config: Config = {}, services: HostServices = {}):
   })
   const skills = new SkillCatalog({
     ...(services.skills !== undefined ? { registry: services.skills } : {}),
+    ...(services.agents !== undefined ? { agents: services.agents } : {}),
+    ...(services.agentPresets !== undefined ? { presets: services.agentPresets } : {}),
     ...(config.skillRoots !== undefined ? { roots: config.skillRoots } : {}),
   })
   const overview = new OverviewService(mcp, skills)
@@ -112,6 +117,18 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.inject(['skills'], (svcCtx) => {
     skills.attachServices({ registry: serviceOf<SkillsRegistryFace>(svcCtx, 'skills') })
     return () => skills.detachServices(['registry'])
+  })
+
+  // 官方 Agent 注册表：把请求的 sessionId 映射到 live Agent（也是会话 scope）。
+  ctx.inject(['agents'], (svcCtx) => {
+    skills.attachServices({ agents: serviceOf<AgentsFace>(svcCtx, 'agents') })
+    return () => skills.detachServices(['agents'])
+  })
+
+  // 官方 preset 注册表：解析会话 preset 内自带的 skills 服务（官方同源回退顺序）。
+  ctx.inject(['agentPresets'], (svcCtx) => {
+    skills.attachServices({ presets: serviceOf<AgentPresetsFace>(svcCtx, 'agentPresets') })
+    return () => skills.detachServices(['presets'])
   })
 
   // 未来环境可选：官方 mcpManager（真实状态 + 显式 probe）；rc.5 无此服务。

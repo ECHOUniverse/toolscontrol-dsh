@@ -1,20 +1,27 @@
 # @hanxu131/toolscontrol-dsh
 
-DSH Desktop 内的独立插件：在插件页“发现”右侧新增 **MCP** 与 **Skills** 两个只读标签，总览当前 Desktop 中 MCP 条目与 Skills 的状态、来源与调用策略。**只读总览**——不做任何启用/禁用、写配置或写文件操作。
+DSH Desktop 内的独立插件：在插件页“发现”右侧新增 **MCP** 与 **技能（Skills）** 两个只读标签，总览当前 Desktop 中 MCP 条目与 Skills 的状态、来源与调用策略。**只读总览**——不做任何启用/禁用、写配置或写文件操作。
 
 > English documentation: [README.en.md](./README.en.md)
 
 ## 功能
 
-- **MCP 标签**：名称搜索；启用状态筛选（已启用 / 已禁用 / 全部，默认只看已启用）；连接状态筛选；手动刷新与最近刷新时间；行内详情（连接状态、来源、是否已配置）。
-- **Skills 标签**：名称/描述/使用时机搜索；来源筛选；调用方式筛选（人工可调用 / 模型可调用 / 均不可）；手动刷新；行内详情（描述、whenToUse、来源、路径、调用策略）；同名**被遮蔽版本**只在该生效项的详情中展示，不作为独立主行。
-- **工作区跟踪**：跟随 Desktop 左侧当前选中的工作区（主 Session 的 `retainedBy.mainView`），切换工作区自动按新 `cwd` 重新获取；没有主 Session 时明确显示“未选中工作区 — 全局 Skills”，不猜默认目录。
+- **MCP 标签**：名称搜索；启用状态筛选（已启用 / 已禁用 / 全部，默认只看已启用）；连接状态筛选；手动刷新与上次刷新时间；行内详情（连接状态、作用域、来源、是否已配置）。条目按 DSH 组合作用域标注：**DSH profile 根级**或 **Preset：<名称>**；同名条目出现在不同作用域时分别展示，绝不合并成一个全局项。
+- **技能标签**：名称/描述/适用场景搜索；来源筛选（全部来源 + 各来源）；调用方式筛选（全部调用方式 / 用户可调用 / 模型可调用 / 不可调用）；手动刷新；行内详情（描述、适用场景、来源、路径、调用策略）；同名**被覆盖版本**只在该生效项的详情中展示，不作为独立主行。来源按宿主语言显示（如“DSH 内置”“插件提供”“用户 .dsh 目录”“项目 .agents 目录”），未知或未来来源回退原始 id。
+- **工作区与会话跟踪**：跟随 Desktop 左侧当前选中的工作区（主 Session 的 `retainedBy.mainView`），切换工作区自动按新 `cwd` 重新获取；Skills 同时按该主 Session 的 live Agent 读取其 **preset scope**（请求携带 `sessionId`），同一 cwd 下切换 Session 也会重新获取。没有主 Session 时明确显示“未选中工作区 — 以下为全局技能，项目级目录未知”，只展示全局注册表；有主会话但项目目录未知时显示“当前会话：<sessionId> — 已按该会话的 preset 范围读取技能；项目目录未知”，不猜默认目录、不冒充全局或会话结果。
 - **双语**：中英文界面文案注册到宿主 locale，跟随宿主语言；条目名称不翻译；列表按当前语言 `Intl.Collator` 稳定排序。
 - **键盘可用**：行内展开使用真实按钮（`aria-expanded` / `aria-controls`），焦点环跟随宿主令牌。
 
 ## rc.5 能力边界（Desktop 0.2.1-rc.5）
 
-MCP 数据来自 pluginInventory 配置层（`mode: "config"`）：
+MCP 数据来自 pluginInventory 配置层（`mode: "config"`），合并官方 `list()` 的**两处**组装面：
+
+- **profile 根级** `entries`：当前 Desktop profile 根组合里的 Loader 条目（作用域标注“DSH profile 根级”）；
+- **preset 组合** `agentPresets[].rows`：每个 agent preset 组合内声明的行（作用域标注“Preset：<名称>”）。当前 DSH 的会话 preset 层才是模型可见插件真正生效的位置，只在 preset 里配置的 MCP server 也必须出现。
+
+去重规则：同一 `(作用域, preset id, 条目名)` 只保留首条，并在页面 warnings 中说明忽略了几条重复项；**不同作用域的同名条目不算重复**，分别展示。preset 行没有 Loader 条目 id（官方类型允许 `entryId: null`）时回退模块名；`disabled` 为表达式（官方 `'conditional'`）时静态无法求值，界面标注“条件启用”，不假装已静态启用/禁用。MCP 行的 `enabled` 只接受 boolean 或 `'conditional'`；缺失或其它类型不能默认成已启用，该行跳过并给出 warning。畸形数据（`agentPresets` 非数组、preset 缺 id、`rows` 非数组、行无法解析）逐项跳过并给出 warning，快照不整体失败。
+
+当整个 DSH 组合（profile 根级 + 全部 presets）都被完整读取且没有 MCP server 时，空态明确显示**“当前 DSH profile / presets 未配置 MCP server（仅统计 DSH 内部数据源，未读取外部 CLI 配置）”**——这是完整可读快照的结论，不等于本机任何外部 CLI 里没有 MCP。任一数据来源不可用、组装面/条目无法解析时，快照带 `canAssertEmpty=false`，界面退化为通用空态并保留 warnings，不断言“未配置”。
 
 | 能力 | rc.5 | 行为 |
 | --- | --- | --- |
@@ -24,12 +31,12 @@ MCP 数据来自 pluginInventory 配置层（`mode: "config"`）：
 
 未来官方 `mcpManager` 托管模式可用时（`mode: "managed"`）：显示真实连接状态与工具数量；“加载工具列表”按钮出现在行内详情中，**只有用户点击才发起探测**（POST，按名称，不改任何配置），从不自动探测。
 
-Skills 限制：被遮蔽版本不保证完整——**插件运行时、preset 与自定义目录来源的竞争版本不可完整枚举**，宿主返回的枚举限制警告始终以横幅展示，不会因单来源失败变成整页空态；真正请求失败且无旧数据时才显示错误空态，有旧数据时保留并提示。
+Skills 限制：被覆盖版本不保证完整——**插件运行时、preset 与自定义目录来源的竞争版本不可完整枚举**，宿主返回的枚举限制说明始终显示在“注意事项”中，不会因单来源失败变成整页空态；真正请求失败且无旧数据时才显示错误空态，有旧数据时保留并提示。
 
 ## 安全模型
 
 - Host 路由同源挂载在 `/toolscontrol`：仅 `health` 公开（只含插件标识）；`overview` / `mcp/probe` 先过官方 `connection.requestRejection` 信任门（认证 + Host/Origin/`sec-fetch-site`）。
-- wire 载荷**永不携带** MCP env / headers / token / 命令 / URL 等敏感字段；Client 只做同源 `fetch`，不读取任何配置文件。
+- wire 载荷**永不携带** MCP env / headers / token / 命令 / URL 等敏感字段；Client 只做同源 `fetch`，不读取任何配置文件。MCP 数据只来自 DSH 自身组合（pluginInventory），**不读取 `~/.cursor`、`~/.kimi-code`、`~/.config/mcp` 等外部 CLI 配置**，也不新增外部 MCP 适配器。
 - Client 端不渲染任何敏感配置；无 Switch 等修改控件。
 
 ## 安装与卸载

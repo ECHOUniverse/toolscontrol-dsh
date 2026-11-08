@@ -207,7 +207,7 @@ describe('GET /toolscontrol/overview（只读总览快照）', () => {
     expect(body.plugin).toBe('@hanxu131/toolscontrol-dsh')
     expect(body.mcp.mode).toBe('config')
     expect(body.mcp.servers).toEqual([
-      { name: 'mcp.notes', enabled: true, configured: true, status: 'unknown', source: 'unknown' },
+      { name: 'mcp.notes', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'profile' },
     ])
     expect(body.skills.skills.map((entry: { name: string }) => entry.name)).toEqual(['demo'])
     expect(body.skills.cwd).toBeNull()
