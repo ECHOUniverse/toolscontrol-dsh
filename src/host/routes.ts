@@ -46,6 +46,8 @@ const MAX_JSON_BODY_BYTES = 64 * 1024
 const MAX_CWD_LENGTH = 4096
 /** sessionId 参数长度上限（官方 SessionId 的长度预算）。 */
 const MAX_SESSION_ID_LENGTH = 256
+/** probeKey 长度上限（scope/presetId/entryId 编码后的预算）。 */
+const MAX_PROBE_KEY_LENGTH = 512
 
 /** 在组合 webServer 上注册整张路由表，返回注销函数。 */
 export function registerRoutes(webServer: WebServerFace, deps: RouteDeps): () => void {
@@ -93,14 +95,31 @@ export function registerRoutes(webServer: WebServerFace, deps: RouteDeps): () =>
         // ------------------------------------------- explicit MCP probe
         if (pathname === ROUTES.probe) {
           if (method !== 'POST') return sendMethodNotAllowed(res, 'POST')
-          const body = await readJsonObject(req, res, MAX_JSON_BODY_BYTES)
-          if (body === null) return
-          const server = body.server
-          if (typeof server !== 'string' || server.trim() === '' || server.length > 256) {
-            return sendError(res, 400, 'invalid_input', 'server must be a non-empty name (max 256 chars)')
+          // 断连监听必须在读取请求体**之前**建立：body 尚未读完时客户端
+          // 就可能已经断开（大 body / 慢客户端）。整个分支共用同一个
+          // signal，任何早退都在 finally 里注销监听。
+          const abort = requestAbortSignal(req, res)
+          try {
+            const body = await readJsonObject(req, res, MAX_JSON_BODY_BYTES)
+            if (body === null) return
+            // body 读完后已断开：绝不发起探测，也不向已关闭的响应写入。
+            if (abort.signal.aborted) return
+            const probeKey = body.probeKey
+            if (typeof probeKey === 'string' && probeKey.trim() !== '') {
+              if (probeKey.length > MAX_PROBE_KEY_LENGTH) {
+                return sendError(res, 400, 'invalid_input', `probeKey must be at most ${MAX_PROBE_KEY_LENGTH} chars`)
+              }
+              // 业务结果（含 ok:false 的不可用/失败语义）以 200 承载；客户端按 ok 分支。
+              return sendJson(res, 200, await overview.probeByKey(probeKey, { signal: abort.signal }))
+            }
+            const server = body.server
+            if (typeof server !== 'string' || server.trim() === '' || server.length > 256) {
+              return sendError(res, 400, 'invalid_input', 'probeKey must be a non-empty string (or legacy server name, max 256 chars)')
+            }
+            return sendJson(res, 200, await overview.probe(server, { signal: abort.signal }))
+          } finally {
+            abort.dispose()
           }
-          // 业务结果（含 ok:false 的不可用/失败语义）以 200 承载；客户端按 ok 分支。
-          return sendJson(res, 200, await overview.probe(server))
         }
 
         return sendError(res, 404, 'not_found', `No route ${method} ${pathname}`)
@@ -110,6 +129,26 @@ export function registerRoutes(webServer: WebServerFace, deps: RouteDeps): () =>
       }
     },
   })
+}
+
+/** 监听请求/响应中断，给显式探测提供一个可取消的 AbortSignal。 */
+function requestAbortSignal(req: RouteRequest, res: RouteResponse): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController()
+  const onAborted = (): void => controller.abort()
+  const onClose = (): void => {
+    if (!res.writableEnded) controller.abort()
+  }
+  const reqEvents = req as unknown as { once?: (event: string, listener: () => void) => void; off?: (event: string, listener: () => void) => void }
+  const resEvents = res as unknown as { once?: (event: string, listener: () => void) => void; off?: (event: string, listener: () => void) => void }
+  reqEvents.once?.('aborted', onAborted)
+  resEvents.once?.('close', onClose)
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      reqEvents.off?.('aborted', onAborted)
+      resEvents.off?.('close', onClose)
+    },
+  }
 }
 
 /**

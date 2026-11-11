@@ -26,6 +26,29 @@ class MockResponse {
   headers = new Map<string, string | string[]>()
   chunks: (string | Buffer)[] = []
   writableEnded = false
+  private listeners = new Map<string, Set<() => void>>()
+
+  on(event: string, listener: () => void): void {
+    const set = this.listeners.get(event) ?? new Set()
+    set.add(listener)
+    this.listeners.set(event, set)
+  }
+
+  once(event: string, listener: () => void): void {
+    const wrapped = (): void => {
+      this.off(event, wrapped)
+      listener()
+    }
+    this.on(event, wrapped)
+  }
+
+  off(event: string, listener: () => void): void {
+    this.listeners.get(event)?.delete(listener)
+  }
+
+  emit(event: string): void {
+    for (const listener of [...(this.listeners.get(event) ?? [])]) listener()
+  }
 
   setHeader(name: string, value: string | string[]): void {
     this.headers.set(String(name).toLowerCase(), value)
@@ -207,7 +230,17 @@ describe('GET /toolscontrol/overview（只读总览快照）', () => {
     expect(body.plugin).toBe('@hanxu131/toolscontrol-dsh')
     expect(body.mcp.mode).toBe('config')
     expect(body.mcp.servers).toEqual([
-      { name: 'mcp.notes', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'profile' },
+      {
+        name: 'mcp.notes',
+        enabled: true,
+        configured: true,
+        status: 'unknown',
+        source: 'unknown',
+        scope: 'profile',
+        probeKey: 'profile:mcp.notes',
+        probeAvailable: false,
+        probeUnavailableReason: 'probe_unavailable',
+      },
     ])
     expect(body.skills.skills.map((entry: { name: string }) => entry.name)).toEqual(['demo'])
     expect(body.skills.cwd).toBeNull()
@@ -239,10 +272,32 @@ describe('GET /toolscontrol/overview（只读总览快照）', () => {
     expect(res.status).toBe(405)
     expect(res.getHeader('allow')).toBe('GET')
   })
+
+  it('配置收集永久挂起：overview 仍按时返回，探测降级但服务器列表保留', async () => {
+    const overview = new OverviewService(
+      new McpCatalog({
+        inventory: { list: async () => ({ entries: [INVENTORY_ENTRY] }) },
+        probeReader: { collect: () => new Promise(() => undefined) },
+        probeRuntime: { configTimeoutMs: 30 },
+      }),
+      new SkillCatalog({ registry: { list: async () => [SKILL] } }),
+    )
+    const webServer = stubWebServer()
+    registerRoutes(webServer, { overview, connection: fakeConnection() })
+    const res = new MockResponse()
+    const started = Date.now()
+    await webServer.routes[0]!.handler(mockRequest(ROUTES.overview), res)
+    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(res.status).toBe(200)
+    const body = res.json()
+    expect(body.mcp.servers.map((entry: { name: string }) => entry.name)).toEqual(['mcp.notes'])
+    expect(body.mcp.probe.available).toBe(false)
+    expect(body.skills.skills.map((entry: { name: string }) => entry.name)).toEqual(['demo'])
+  })
 })
 
 describe('POST /toolscontrol/mcp/probe（显式工具探测）', () => {
-  it('按名称探测：rc.5 无管理服务时返回业务结果 probe_unavailable', async () => {
+  it('按旧版 server 名称探测：rc.5 无管理服务时返回业务结果 unavailable', async () => {
     const { call } = mount()
     const res = await call(ROUTES.probe, {
       method: 'POST',
@@ -250,11 +305,149 @@ describe('POST /toolscontrol/mcp/probe（显式工具探测）', () => {
       body: JSON.stringify({ server: 'mcp.notes' }),
     })
     expect(res.status).toBe(200)
-    expect(res.json()).toEqual({
+    expect(res.json()).toMatchObject({
       ok: false,
-      code: 'probe_unavailable',
+      code: 'unavailable',
+      stage: 'unavailable',
+      probeKey: 'managed:mcp.notes',
       message: expect.stringContaining('MCP 管理服务'),
     })
+  })
+
+  it('按 probeKey 单条探测：200 承载业务结果，并传递可中断的 AbortSignal', async () => {
+    const webServer = stubWebServer()
+    let seenKey = ''
+    let seenSignal: AbortSignal | undefined
+    const overview = {
+      snapshot: async () => { throw new Error('not used') },
+      probe: async () => { throw new Error('not used') },
+      probeByKey: async (probeKey: string, options: { signal?: AbortSignal }) => {
+        seenKey = probeKey
+        seenSignal = options.signal
+        return new Promise((resolve) => {
+          options.signal?.addEventListener('abort', () => {
+            resolve({
+              ok: false as const,
+              probeKey,
+              stage: 'cancelled' as const,
+              code: 'cancelled' as const,
+              message: '探测已取消',
+              durationMs: 0,
+            })
+          })
+        })
+      },
+    }
+    registerRoutes(webServer, { overview: overview as unknown as OverviewService, connection: fakeConnection() })
+    const res = new MockResponse()
+    const running = webServer.routes[0]!.handler(
+      mockRequest(ROUTES.probe, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ probeKey: 'profile:mcp.notes' }),
+      }),
+      res,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(seenKey).toBe('profile:mcp.notes')
+    expect(seenSignal?.aborted).toBe(false)
+    res.emit('close')
+    await running
+    expect(seenSignal?.aborted).toBe(true)
+    expect(res.status).toBe(200)
+    expect(res.json()).toMatchObject({ ok: false, code: 'cancelled' })
+  })
+
+  it('请求体读取期间断开：不发起探测、不向已关闭的响应写入', async () => {
+    const webServer = stubWebServer()
+    let probed = 0
+    const overview = {
+      snapshot: async () => {
+        throw new Error('not used')
+      },
+      probe: async () => {
+        probed += 1
+        throw new Error('not used')
+      },
+      probeByKey: async () => {
+        probed += 1
+        throw new Error('not used')
+      },
+    }
+    registerRoutes(webServer, { overview: overview as unknown as OverviewService, connection: fakeConnection() })
+    const res = new MockResponse()
+    // body 的异步迭代期间客户端断开：监听必须在读取请求体之前就已建立。
+    const req: any = {
+      url: ROUTES.probe,
+      method: 'POST',
+      headers: { host: '127.0.0.1:3080', 'content-type': 'application/json' },
+      resume(): void {},
+      async *[Symbol.asyncIterator](): AsyncGenerator<Buffer> {
+        res.emit('close')
+        yield Buffer.from(JSON.stringify({ probeKey: 'profile:mcp.notes' }))
+      },
+    }
+    await webServer.routes[0]!.handler(req, res)
+    expect(probed).toBe(0)
+    expect(res.writableEnded).toBe(false)
+    expect(res.body).toBe('')
+  })
+
+  it('正常完成的响应不会被误判为断开（signal 未 abort）', async () => {
+    const webServer = stubWebServer()
+    const seen: AbortSignal[] = []
+    const overview = {
+      snapshot: async () => {
+        throw new Error('not used')
+      },
+      probe: async () => {
+        throw new Error('not used')
+      },
+      probeByKey: async (probeKey: string, options: { signal?: AbortSignal }) => {
+        if (options.signal !== undefined) seen.push(options.signal)
+        return {
+          ok: true as const,
+          probeKey,
+          scope: 'profile' as const,
+          entryId: 'mcp.notes',
+          probedAt: 1,
+          durationMs: 1,
+          toolNames: ['t'],
+          toolCount: 1,
+        }
+      },
+    }
+    registerRoutes(webServer, { overview: overview as unknown as OverviewService, connection: fakeConnection() })
+    const res = new MockResponse()
+    await webServer.routes[0]!.handler(
+      mockRequest(ROUTES.probe, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ probeKey: 'profile:mcp.notes' }),
+      }),
+      res,
+    )
+    expect(res.status).toBe(200)
+    expect(res.json()).toMatchObject({ ok: true, toolNames: ['t'] })
+    expect(seen).toHaveLength(1)
+    expect(seen[0]!.aborted).toBe(false)
+  })
+
+  it('probeKey 超长 → 400；probeKey 与 server 都缺失 → 400', async () => {
+    const { call } = mount()
+    const tooLong = await call(ROUTES.probe, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ probeKey: `profile:${'x'.repeat(600)}` }),
+    })
+    expect(tooLong.status).toBe(400)
+    expect(tooLong.json().error.code).toBe('invalid_input')
+    const missing = await call(ROUTES.probe, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    })
+    expect(missing.status).toBe(400)
   })
 
   it('缺 server 字段 → 400', async () => {

@@ -106,7 +106,18 @@ function snapshotOf(cwd: string | null): OverviewSnapshot {
     mcp: {
       mode: 'config',
       capabilities: { connectionStatus: false, toolCount: false, probe: false },
-      servers: [{ name: 'siyuan', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'profile' }],
+      servers: [
+        {
+          name: 'siyuan',
+          enabled: true,
+          configured: true,
+          status: 'unknown',
+          source: 'unknown',
+          scope: 'profile',
+          probeKey: 'profile:siyuan',
+          probeAvailable: true,
+        },
+      ],
       warnings: [],
     },
     skills: { cwd, skills: [], warnings: [] },

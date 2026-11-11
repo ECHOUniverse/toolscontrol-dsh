@@ -8,7 +8,8 @@
  *   畸形状态防御为 unknown + warning），probe 仅显式调用；
  * - `config` — rc.5 降级：`pluginInventory` 只提供配置条目与可靠的
  *   启用状态；连接状态恒为 `unknown`（CONTEXT.md「连接状态未知」——
- *   绝不从插件加载状态推断），能力全部标注不可用。
+ *   绝不从插件加载状态推断），`capabilities` 仍标注不可用；独立探测
+ *   能力单独由 `probe` 字段表达。
  *   `config` 合并官方 `list()` 的两处组装面：profile 根级 `entries` 与
  *   `agentPresets[].rows`（preset 组合，scope `preset`）。当前 DSH 的
  *   MCP 行可以只存在于 preset 组合内，只看根级会漏报。
@@ -16,24 +17,38 @@
  * 两个来源都以可选晚绑定服务注入（`attachServices`）；都不存在或读取
  * 失败时快照降级为 `unavailable` + warning，绝不整体失败。
  *
+ * 独立探测（`probeKey` / `probeByKey`）只读取配置并在显式调用时建立
+ * 一次短期连接；它不改变连接状态字段，快照读取路径绝不触发连接。
+ *
  * 安全红线：快照只含聚合语义字段；条目携带的任何 env/headers/command/
  * URL/token 一律不进入 DTO（结构面类型上就未声明这些字段）。
  *
  * @module @hanxu131/toolscontrol-dsh/host/mcp
  */
 
-import type { McpCapabilities, McpPresetRef, McpProbeResponse, McpSnapshot, McpServerEntry } from '../shared/protocol.ts'
+import type {
+  McpCapabilities,
+  McpPresetRef,
+  McpProbeAvailability,
+  McpProbeResponse,
+  McpProbeStage,
+  McpSnapshot,
+  McpServerEntry,
+} from '../shared/protocol.ts'
 import { errorMessage } from './services.ts'
-import type { McpManagerFace, McpProbeOutcomeFace, McpManagedServerViewFace, PluginInventoryFace } from './services.ts'
+import type {
+  AgentPresetsFace,
+  LoaderFace,
+  McpManagerFace,
+  McpProbeOutcomeFace,
+  McpManagedServerViewFace,
+  PluginInventoryFace,
+} from './services.ts'
+import { isMcpClientModule, McpProbeConfigReader, probeKeyForEntry, type ProbeCandidate, type ProbeConfigCollection, type ProbeConfigReaderFace } from './mcp-config.ts'
+import { McpProbeService, type McpProbeRuntimeOptions } from './mcp-probe.ts'
 import { warn, warningLog, type WarningLog } from './warnings.ts'
 
-/** Loader 条目视作 MCP 配置项的模块名（官方包名与插件短名）。 */
-const MCP_CLIENT_MODULES = new Set(['@deepseek-ai/dsh-mcp-client', 'mcp-client'])
-
-/** 是否为 MCP 客户端配置条目（精确匹配，避免前缀/后缀误判）。 */
-export function isMcpClientModule(moduleName: string): boolean {
-  return MCP_CLIENT_MODULES.has(moduleName)
-}
+export { isMcpClientModule } from './mcp-config.ts'
 
 /** 官方行启用状态：boolean 或静态无法求值的 `'conditional'`。 */
 function isMcpEnablement(value: unknown): value is boolean | 'conditional' {
@@ -44,6 +59,14 @@ function isMcpEnablement(value: unknown): value is boolean | 'conditional' {
 export interface McpCatalogServices {
   inventory?: PluginInventoryFace
   manager?: McpManagerFace
+  /** profile 根级配置读面（探测用；缺失只降级探测）。 */
+  loader?: LoaderFace
+  /** agent preset 声明读面（探测用；缺失只降级探测）。 */
+  presets?: AgentPresetsFace
+  /** 测试接缝：直接提供探测配置读取器。 */
+  probeReader?: ProbeConfigReaderFace
+  /** 测试接缝：并发/超时/连接器覆盖。 */
+  probeRuntime?: McpProbeRuntimeOptions
 }
 
 /** rc.5 能力边界：连接状态不可观测，工具数量与探测不可用。 */
@@ -53,23 +76,58 @@ const DEGRADED_CAPABILITIES: McpCapabilities = { connectionStatus: false, toolCo
 export class McpCatalog {
   private inventory: PluginInventoryFace | undefined
   private manager: McpManagerFace | undefined
+  private readonly configReader: McpProbeConfigReader
+  private readonly reader: ProbeConfigReaderFace
+  private readonly probeService: McpProbeService
 
   constructor(services: McpCatalogServices = {}) {
     this.inventory = services.inventory
     this.manager = services.manager
+    this.configReader = new McpProbeConfigReader({
+      ...(services.loader !== undefined ? { loader: services.loader } : {}),
+      ...(services.presets !== undefined ? { presets: services.presets } : {}),
+    })
+    this.reader = services.probeReader ?? this.configReader
+    this.probeService = new McpProbeService(this.reader, services.probeRuntime)
   }
 
   /** 晚绑定：对应 `ctx.inject` effect 触发时挂上服务。 */
   attachServices(services: McpCatalogServices): void {
     if (services.inventory !== undefined) this.inventory = services.inventory
     if (services.manager !== undefined) this.manager = services.manager
+    this.configReader.attachServices({
+      ...(services.loader !== undefined ? { loader: services.loader } : {}),
+      ...(services.presets !== undefined ? { presets: services.presets } : {}),
+    })
+    // 配置面变化：立即丢弃探测配置缓存，不等 TTL。
+    this.probeService.invalidateConfig()
   }
 
   /** 晚绑定：服务 cycle/卸载时摘除，回到降级路径。 */
-  detachServices(names: readonly ('inventory' | 'manager')[]): void {
+  detachServices(names: readonly ('inventory' | 'manager' | 'loader' | 'presets')[]): void {
     for (const name of names) {
       if (name === 'inventory') this.inventory = undefined
       if (name === 'manager') this.manager = undefined
+    }
+    this.configReader.detachServices(names.filter((name): name is 'loader' | 'presets' => name === 'loader' || name === 'presets'))
+    this.probeService.invalidateConfig()
+  }
+
+  /** 插件 dispose：中止在途探测并等待连接关闭。 */
+  disposeProbes(): Promise<void> {
+    return this.probeService.dispose()
+  }
+
+  /** 探测配置面不可读时的统一能力声明。 */
+  private unavailableProbe(): McpProbeAvailability {
+    return {
+      available: false,
+      manualOnly: true,
+      maxConcurrent: this.probeService.maxConcurrent,
+      timeoutMs: this.probeService.timeoutMs,
+      profile: false,
+      presets: false,
+      reason: 'config_source_unavailable',
     }
   }
 
@@ -82,44 +140,104 @@ export class McpCatalog {
     if (this.inventory !== undefined) return await this.configSnapshot(this.inventory)
     const warnings = warningLog()
     warn(warnings, 'mcp.inventoryUnavailable', undefined, 'pluginInventory 服务不可用：MCP 配置条目无法读取')
-    return unavailableSnapshot(warnings)
+    return unavailableSnapshot(warnings, this.unavailableProbe())
   }
 
   /**
-   * 显式工具探测（CONTEXT.md「工具探测」）：只按名称探测，不改任何配置，
-   * 也不会被快照等读取路径自动触发。rc.5 无官方管理服务 → 能力不可用。
+   * 显式单条探测（新契约）：只接受快照给出的稳定 `probeKey`。旧版
+   * `managed:<name>` 键继续走官方 mcpManager，保持托管路径兼容。
    */
-  async probe(server: string): Promise<McpProbeResponse> {
+  probeByKey(probeKey: string, options: { signal?: AbortSignal } = {}): Promise<McpProbeResponse> {
+    if (probeKey.startsWith('managed:')) {
+      let name: string
+      try {
+        name = decodeURIComponent(probeKey.slice('managed:'.length))
+      } catch {
+        return Promise.resolve(this.probeFailure(probeKey, 'unavailable', '未找到该探测键对应的条目（配置可能已变化）', 0))
+      }
+      return this.probeManaged(name, options.signal)
+    }
+    return this.probeService.probe(probeKey, options)
+  }
+
+  /**
+   * 旧版按名称探测（托管路径兼容）：官方 mcpManager 存在时转发；失败
+   * 只返回固定分类与脱敏文案，绝不透传原始错误。
+   */
+  probe(server: string, options: { signal?: AbortSignal } = {}): Promise<McpProbeResponse> {
+    return this.probeManaged(server, options.signal)
+  }
+
+  /**
+   * 托管路径（官方 `mcpManager.probe`）：与独立探测共用同一套限制——
+   * 全局并发 2、单条 10s 预算、调用者取消、dispose。
+   *
+   * 已知限制：官方 `probe(server)` 没有 AbortSignal 参数，**底层不可
+   * 取消**。因此调用者取消/超时时本插件只保证本地响应立即返回、槽位与
+   * dispose 语义正确；官方连接会自行继续到它自己的超时。
+   */
+  private probeManaged(server: string, signal: AbortSignal | undefined): Promise<McpProbeResponse> {
+    const probeKey = probeKeyForEntry('unknown', server)
     const manager = this.manager
     if (manager === undefined || typeof manager.probe !== 'function') {
-      return {
-        ok: false,
-        code: 'probe_unavailable',
-        message: '当前 Desktop 版本没有可用的 MCP 管理服务，无法探测工具',
+      return Promise.resolve(this.probeFailure(probeKey, 'unavailable', '当前 Desktop 版本没有可用的 MCP 管理服务，无法探测工具', 0))
+    }
+    const invoke = manager.probe.bind(manager)
+    return this.probeService.execute(probeKey, signal !== undefined ? { signal } : {}, async (budget) => {
+      // 与独立探测共用同一个全局并发槽；槽位在本地 settle 时释放，即使
+      // 官方 probe 不可取消、仍在后台继续，也不会永久占用槽位。
+      const releaseSlot = await budget.acquireSlot()
+      if (releaseSlot === undefined) {
+        const stage = budget.abortStage()
+        return this.probeFailure(probeKey, stage, stageMessage(stage), budget.elapsed())
       }
-    }
-    let outcome: McpProbeOutcomeFace
-    try {
-      outcome = await manager.probe(server)
-    } catch (error) {
-      return { ok: false, code: 'probe_failed', message: errorMessage(error) }
-    }
-    if (typeof outcome === 'object' && outcome !== null && (outcome as { ok?: unknown }).ok === true) {
-      const toolNames = (outcome as { toolNames?: unknown }).toolNames
-      if (!Array.isArray(toolNames)) {
-        return { ok: false, code: 'probe_failed', message: 'probe 返回了无法解析的结果' }
+      let outcome: McpProbeOutcomeFace
+      try {
+        outcome = await budget.race(Promise.resolve().then(() => invoke(server)))
+      } catch {
+        const stage = budget.signal.aborted || budget.remaining() <= 0 ? budget.abortStage() : 'connect'
+        return this.probeFailure(probeKey, stage, stageMessage(stage), budget.elapsed())
+      } finally {
+        releaseSlot()
       }
-      return { ok: true, toolNames: toolNames.map((name) => String(name)) }
+      // 防御：超过预算或已取消时绝不把迟到的结果当成功返回。
+      if (budget.signal.aborted || budget.remaining() <= 0) {
+        const stage = budget.abortStage()
+        return this.probeFailure(probeKey, stage, stageMessage(stage), budget.elapsed())
+      }
+      if (typeof outcome === 'object' && outcome !== null && (outcome as { ok?: unknown }).ok === true) {
+        const toolNames = (outcome as { toolNames?: unknown }).toolNames
+        if (!Array.isArray(toolNames)) {
+          return this.probeFailure(probeKey, 'tools_list', '已连接，但读取工具列表失败', budget.elapsed())
+        }
+        return {
+          ok: true,
+          probeKey,
+          scope: 'unknown',
+          entryId: null,
+          probedAt: Date.now(),
+          durationMs: budget.elapsed(),
+          toolNames: toolNames.map((name) => String(name)),
+          toolCount: toolNames.length,
+        }
+      }
+      const stage = typeof outcome === 'object' && outcome !== null ? (outcome as { stage?: unknown }).stage : undefined
+      const code = managerStage(typeof stage === 'string' ? stage : '')
+      return this.probeFailure(probeKey, code, stageMessage(code), budget.elapsed())
+    })
+  }
+
+  private probeFailure(probeKey: string, code: McpProbeStage, message: string, durationMs: number): McpProbeResponse {
+    return {
+      ok: false,
+      probeKey,
+      scope: 'unknown',
+      entryId: null,
+      stage: code,
+      code,
+      message,
+      durationMs,
     }
-    if (
-      typeof outcome === 'object' && outcome !== null && (outcome as { ok?: unknown }).ok === false &&
-      typeof (outcome as { stage?: unknown }).stage === 'string' &&
-      typeof (outcome as { message?: unknown }).message === 'string'
-    ) {
-      const failure = outcome as { stage: string; message: string }
-      return { ok: false, code: 'probe_failed', message: failure.message, stage: failure.stage }
-    }
-    return { ok: false, code: 'probe_failed', message: 'probe 返回了无法解析的结果' }
   }
 
   /**
@@ -143,7 +261,7 @@ export class McpCatalog {
       snapshot = await inventory.list()
     } catch (error) {
       warn(extraWarnings, 'mcp.inventoryReadFailed', { message: errorMessage(error) }, `pluginInventory 读取失败：${errorMessage(error)}`)
-      return unavailableSnapshot(extraWarnings)
+      return unavailableSnapshot(extraWarnings, this.unavailableProbe())
     }
     const warnings: WarningLog = extraWarnings
     const servers: McpServerEntry[] = []
@@ -196,6 +314,8 @@ export class McpCatalog {
         source: 'unknown',
         scope,
         ...(preset !== undefined ? { preset } : {}),
+        probeKey: probeKeyForEntry(scope, name, preset?.id),
+        probeAvailable: false,
       })
     }
 
@@ -265,14 +385,14 @@ export class McpCatalog {
         `已忽略 ${duplicates} 条重复的 MCP 条目（同一 profile/preset 作用域内同名条目只保留首条；不同作用域的同名条目不算重复）`,
       )
     }
-    return {
+    return await this.withConfigProbeInfo({
       mode: 'config',
       capabilities: DEGRADED_CAPABILITIES,
       canAssertEmpty: complete,
       servers,
       warnings: warnings.warnings,
       warningItems: warnings.warningItems,
-    }
+    })
   }
 
   /** 官方 mcpManager 存在：透传真实状态（status.state 字符串）；畸形防御。 */
@@ -284,7 +404,7 @@ export class McpCatalog {
       const failure = warningLog()
       warn(failure, 'mcp.managerReadFailed', { message: errorMessage(error) }, `mcpManager 读取失败：${errorMessage(error)}`)
       if (this.inventory !== undefined) return await this.configSnapshot(this.inventory, failure)
-      return unavailableSnapshot(failure)
+      return unavailableSnapshot(failure, this.unavailableProbe())
     }
     const capabilities: McpCapabilities = {
       connectionStatus: true,
@@ -311,6 +431,8 @@ export class McpCatalog {
           source: 'unknown',
           // 官方 manager 只治理全局面，没有可靠的 preset 归属信息。
           scope: 'unknown',
+          probeKey: probeKeyForEntry('unknown', view.name),
+          probeAvailable: false,
         }
       }
       warn(
@@ -326,9 +448,137 @@ export class McpCatalog {
         status: 'unknown',
         source: 'unknown',
         scope: 'unknown',
+        probeKey: probeKeyForEntry('unknown', view.name),
+        probeAvailable: false,
       }
     })
-    return { mode: 'managed', capabilities, servers, warnings: warnings.warnings, warningItems: warnings.warningItems }
+    return this.withManagedProbeInfo({ mode: 'managed', capabilities, servers, warnings: warnings.warnings, warningItems: warnings.warningItems }, typeof manager.probe === 'function')
+  }
+
+  /**
+   * 配置快照附加独立探测信息（配置读取失败/超时只降级探测，不动服务器
+   * 列表与总览）。读取走探测服务的 single-flight + 短 TTL + 硬上界
+   * （默认 2s），因此总览绝不会被挂住的配置读取拖垮。
+   */
+  private async withConfigProbeInfo(snapshot: McpSnapshot): Promise<McpSnapshot> {
+    let collection: ProbeConfigCollection
+    try {
+      collection = await this.probeService.collectConfig()
+    } catch {
+      return this.withUnavailableProbeInfo(snapshot)
+    }
+    const candidates = new Map<string, ProbeCandidate>()
+    for (const candidate of collection.candidates) {
+      const key = candidateIdentity(candidate.scope, candidate.preset?.id, candidate.name)
+      if (!candidates.has(key)) candidates.set(key, candidate)
+    }
+    const servers = snapshot.servers.map((server) => {
+      const candidate = candidates.get(candidateIdentity(server.scope, server.preset?.id, server.name))
+      if (candidate !== undefined) {
+        return {
+          ...server,
+          probeKey: candidate.probeKey,
+          probeAvailable: candidate.probeAvailable,
+          ...(candidate.probeAvailable ? {} : { probeUnavailableReason: candidate.probeUnavailableReason ?? 'probe_unavailable' }),
+        }
+      }
+      return {
+        ...server,
+        probeKey: probeKeyForEntry(server.scope, server.name, server.preset?.id),
+        probeAvailable: false as const,
+        probeUnavailableReason: 'probe_unavailable' as const,
+      }
+    })
+    return {
+      ...snapshot,
+      servers,
+      probe: {
+        available: collection.available,
+        manualOnly: true,
+        maxConcurrent: this.probeService.maxConcurrent,
+        timeoutMs: this.probeService.timeoutMs,
+        profile: collection.profile,
+        presets: collection.presets,
+        ...(collection.reason !== undefined ? { reason: collection.reason } : {}),
+      },
+    }
+  }
+
+  /** 探测配置面完全不可读：条目保留稳定（但不可用）的探测键。 */
+  private withUnavailableProbeInfo(snapshot: McpSnapshot): McpSnapshot {
+    return {
+      ...snapshot,
+      servers: snapshot.servers.map((server) => ({
+        ...server,
+        probeKey: probeKeyForEntry(server.scope, server.name, server.preset?.id),
+        probeAvailable: false as const,
+        probeUnavailableReason: 'probe_unavailable' as const,
+      })),
+      probe: {
+        available: false,
+        manualOnly: true,
+        maxConcurrent: this.probeService.maxConcurrent,
+        timeoutMs: this.probeService.timeoutMs,
+        profile: false,
+        presets: false,
+        reason: 'config_source_unavailable',
+      },
+    }
+  }
+
+  /** 托管快照的探测键只用于旧版按名称探测（官方 mcpManager）。 */
+  private withManagedProbeInfo(snapshot: McpSnapshot, canProbe: boolean): McpSnapshot {
+    return {
+      ...snapshot,
+      servers: snapshot.servers.map((server) => ({
+        ...server,
+        probeKey: probeKeyForEntry('unknown', server.name),
+        probeAvailable: canProbe && server.enabled,
+        ...(canProbe && server.enabled ? {} : { probeUnavailableReason: canProbe ? ('disabled' as const) : ('probe_unavailable' as const) }),
+      })),
+      probe: {
+        available: canProbe,
+        manualOnly: true,
+        maxConcurrent: this.probeService.maxConcurrent,
+        timeoutMs: this.probeService.timeoutMs,
+        profile: false,
+        presets: false,
+        ...(canProbe ? {} : { reason: 'runtime_unavailable' as const }),
+      },
+    }
+  }
+}
+
+/** inventory 条目与配置候选的同一性键（作用域 + preset + 展示名）。 */
+function candidateIdentity(scope: string, presetId: string | undefined, name: string): string {
+  return `${scope}\u0000${presetId ?? ''}\u0000${name}`
+}
+
+function managerStage(stage: string): McpProbeStage {
+  const value = stage.toLowerCase()
+  if (value.includes('timeout')) return 'timeout'
+  if (value.includes('cancel')) return 'cancelled'
+  if (value.includes('tool') || value.includes('list')) return 'tools_list'
+  if (value.includes('disabled')) return 'disabled'
+  if (value.includes('unavailable') || value.includes('probe')) return 'unavailable'
+  return 'connect'
+}
+
+function stageMessage(code: McpProbeStage): string {
+  switch (code) {
+    case 'timeout':
+      return '探测超时'
+    case 'cancelled':
+      return '探测已取消'
+    case 'tools_list':
+      return '已连接，但读取工具列表失败'
+    case 'disabled':
+      return '该条目标记为未启用，不能探测'
+    case 'unavailable':
+      return '当前 Host 无法探测该条目'
+    case 'connect':
+    default:
+      return '连接 MCP 服务器失败'
   }
 }
 
@@ -400,10 +650,11 @@ function parsePreset(raw: unknown, index: number, warnings: WarningLog): ParsedP
 }
 
 /** 双来源都不可用或读取失败的统一降级快照。 */
-function unavailableSnapshot(warnings: WarningLog): McpSnapshot {
+function unavailableSnapshot(warnings: WarningLog, probe: McpProbeAvailability): McpSnapshot {
   return {
     mode: 'unavailable',
     capabilities: DEGRADED_CAPABILITIES,
+    probe,
     servers: [],
     warnings: warnings.warnings,
     warningItems: warnings.warningItems,

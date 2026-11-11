@@ -99,6 +99,72 @@ export function mcpEmptyStateKey(mcp: McpSnapshot | undefined): string {
 }
 
 // ---------------------------------------------------------------------------
+// Explicit MCP probe gating (slice: manual probe, keyed by `probeKey`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe availability of the snapshot.
+ *
+ * `mcp.probe` is a SEPARATE capability from `capabilities.probe`: rc.5 keeps
+ * `capabilities.probe === false` while the independent Host probe can still
+ * be available. A missing field means an older Host without the capability.
+ */
+export function probeCapabilityAvailable(mcp: McpSnapshot | undefined): boolean {
+  return mcp?.probe?.available === true
+}
+
+/** Minimal entry shape needed by the probe gates (keeps the helpers testable). */
+export interface ProbeTarget {
+  probeKey: string
+  enabled: boolean
+  conditional?: true
+  probeAvailable: boolean
+}
+
+/** Whether one entry may be probed at all (capability + entry gates). */
+export function isProbeTarget(entry: ProbeTarget, mcp: McpSnapshot | undefined): boolean {
+  if (!probeCapabilityAvailable(mcp)) return false
+  if (entry.probeAvailable !== true) return false
+  if (entry.enabled !== true) return false
+  if (entry.conditional === true) return false
+  return true
+}
+
+/** Probe lifecycle subset the view-model needs (never the result payload). */
+export interface ProbePhaseLike {
+  phase: string
+}
+
+/**
+ * Whether a probe may be STARTED right now: the entry passes every gate and
+ * is not already loading. Batch probing skips loading entries (a repeated
+ * click must never duplicate a request).
+ */
+export function isProbeRequestable(
+  entry: ProbeTarget,
+  mcp: McpSnapshot | undefined,
+  probes: Readonly<Record<string, ProbePhaseLike>>,
+): boolean {
+  if (!isProbeTarget(entry, mcp)) return false
+  return probes[entry.probeKey]?.phase !== 'loading'
+}
+
+/**
+ * Count the entries of the CURRENT filtered rows that a "probe all" action
+ * would request. Disabled, not-probeable, conditional and already-loading
+ * entries are excluded, so the toolbar label always matches what is sent.
+ */
+export function countProbeTargets(
+  rows: readonly ProbeTarget[],
+  mcp: McpSnapshot | undefined,
+  probes: Readonly<Record<string, ProbePhaseLike>>,
+): number {
+  let count = 0
+  for (const row of rows) if (isProbeRequestable(row, mcp, probes)) count += 1
+  return count
+}
+
+// ---------------------------------------------------------------------------
 // Skills scope line (session scope vs. workspace directory)
 // ---------------------------------------------------------------------------
 

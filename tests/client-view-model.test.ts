@@ -9,11 +9,15 @@ import {
   DEFAULT_MCP_FILTERS,
   DEFAULT_SKILLS_FILTERS,
   collatorFor,
+  countProbeTargets,
   filterMcpServers,
   filterSkillRows,
   groupSkills,
+  isProbeRequestable,
+  isProbeTarget,
   mcpEmptyStateKey,
   mcpStatusOptions,
+  probeCapabilityAvailable,
   skillSourceOptions,
   skillsScopeLine,
 } from '../src/client/view-model.ts'
@@ -28,6 +32,8 @@ function entry(overrides: Partial<McpServerEntry> & { name: string }): McpServer
     status: 'unknown',
     source: 'unknown',
     scope: 'profile',
+    probeKey: `profile:${overrides.name}`,
+    probeAvailable: true,
     ...overrides,
   }
 }
@@ -97,6 +103,64 @@ describe('MCP 筛选（slice 1）', () => {
 
   it('空快照不产生状态选项', () => {
     expect(mcpStatusOptions([], COLLATOR)).toEqual([])
+  })
+})
+
+describe('MCP 显式探测门控（probeKey）', () => {
+  const CAPABILITIES = { connectionStatus: false, toolCount: false, probe: false }
+  function mcp(probe: McpSnapshot['probe']): McpSnapshot {
+    return { mode: 'config', capabilities: CAPABILITIES, ...(probe !== undefined ? { probe } : {}), servers: [], warnings: [] }
+  }
+  const AVAILABLE = mcp({ available: true, manualOnly: true, maxConcurrent: 2, timeoutMs: 10_000, profile: true, presets: true })
+  const UNAVAILABLE = mcp({ available: false, manualOnly: true, maxConcurrent: 2, timeoutMs: 10_000, profile: false, presets: false, reason: 'config_source_unavailable' })
+
+  it('mcp.probe 缺失或 available=false → 能力关闭；capabilities.probe 不参与门控', () => {
+    expect(probeCapabilityAvailable(undefined)).toBe(false)
+    expect(probeCapabilityAvailable(mcp(undefined))).toBe(false)
+    expect(probeCapabilityAvailable(UNAVAILABLE)).toBe(false)
+    expect(probeCapabilityAvailable(AVAILABLE)).toBe(true)
+    // rc.5 的 capabilities.probe 恒 false，但独立探测可用。
+    expect(AVAILABLE.capabilities.probe).toBe(false)
+    expect(isProbeTarget(entry({ name: 'siyuan' }), AVAILABLE)).toBe(true)
+  })
+
+  it('enabled / probeAvailable / conditional 任一不满足都不可探测', () => {
+    expect(isProbeTarget(entry({ name: 'a', enabled: false }), AVAILABLE)).toBe(false)
+    expect(isProbeTarget(entry({ name: 'a', probeAvailable: false }), AVAILABLE)).toBe(false)
+    expect(isProbeTarget(entry({ name: 'a', conditional: true }), AVAILABLE)).toBe(false)
+    expect(isProbeTarget(entry({ name: 'a' }), UNAVAILABLE)).toBe(false)
+  })
+
+  it('loading 中的条目被视为不可再次发起；计数跳过 loading', () => {
+    const rows = [
+      entry({ name: 'a', probeKey: 'profile:a' }),
+      entry({ name: 'b', probeKey: 'profile:b' }),
+      entry({ name: 'c', probeKey: 'profile:c', probeAvailable: false }),
+      entry({ name: 'd', probeKey: 'profile:d', enabled: false }),
+      entry({ name: 'e', probeKey: 'profile:e', conditional: true }),
+    ]
+    const probes = { 'profile:a': { phase: 'loading' }, 'profile:b': { phase: 'ok' } }
+    expect(isProbeRequestable(rows[0]!, AVAILABLE, probes)).toBe(false)
+    expect(isProbeRequestable(rows[1]!, AVAILABLE, probes)).toBe(true)
+    expect(countProbeTargets(rows, AVAILABLE, probes)).toBe(1)
+    expect(countProbeTargets(rows, AVAILABLE, {})).toBe(2)
+    expect(countProbeTargets(rows, UNAVAILABLE, {})).toBe(0)
+    // 只统计传入的当前行（即筛选后的结果），不是整个快照。
+    expect(countProbeTargets([rows[1]!], AVAILABLE, {})).toBe(1)
+  })
+
+  it('同名但不同 probeKey 的条目互不复用 loading/结果身份', () => {
+    const profileRow = entry({ name: 'same', probeKey: 'profile:same', scope: 'profile' })
+    const presetRow = entry({
+      name: 'same',
+      probeKey: 'preset:p1:same',
+      scope: 'preset',
+      preset: { id: 'p1' },
+    })
+    const probes = { 'profile:same': { phase: 'loading' } }
+    expect(isProbeRequestable(profileRow, AVAILABLE, probes)).toBe(false)
+    expect(isProbeRequestable(presetRow, AVAILABLE, probes)).toBe(true)
+    expect(countProbeTargets([profileRow, presetRow], AVAILABLE, probes)).toBe(1)
   })
 })
 

@@ -51,13 +51,37 @@ function rawInventoryOf(snapshot: { entries?: readonly unknown[]; agentPresets?:
   }
 }
 
+/** 预期配置层条目的新探测字段（测试未注入 loader/presets → 仅 baseline key）。 */
+function configEntry<T extends { name: string; scope: 'profile' | 'preset'; preset?: { id: string } }>(entry: T) {
+  const key =
+    entry.scope === 'profile'
+      ? `profile:${encodeURIComponent(entry.name)}`
+      : `preset:${encodeURIComponent(entry.preset?.id ?? '')}:${encodeURIComponent(entry.name)}`
+  return {
+    ...entry,
+    probeKey: key,
+    probeAvailable: false as const,
+    probeUnavailableReason: 'probe_unavailable' as const,
+  }
+}
+
+/** 预期托管层条目的新探测字段（manager 未提供 probe）。 */
+function managedEntry<T extends { name: string }>(entry: T) {
+  return {
+    ...entry,
+    probeKey: `managed:${encodeURIComponent(entry.name)}`,
+    probeAvailable: false as const,
+    probeUnavailableReason: 'probe_unavailable' as const,
+  }
+}
+
 describe('MCP 配置层聚合（rc.5 pluginInventory 降级）', () => {
   it('把 mcp-client 配置条目聚合成服务器条目，来源保守标未知', async () => {
     const catalog = new McpCatalog({ inventory: inventoryOf([MCP_ENTRY]) })
     const snap = await catalog.snapshot()
     expect(snap.mode).toBe('config')
     expect(snap.servers).toEqual([
-      { name: 'mcp.notes', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'profile' },
+      configEntry({ name: 'mcp.notes', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'profile' }),
     ])
   })
 
@@ -122,7 +146,17 @@ describe('MCP 配置层聚合（rc.5 pluginInventory 降级）', () => {
     expect(text).not.toContain('127.0.0.1:9999')
     // 字段白名单：服务器条目只允许聚合语义字段
     for (const server of snap.servers) {
-      expect(Object.keys(server).sort()).toEqual(['configured', 'enabled', 'name', 'scope', 'source', 'status'])
+      expect(Object.keys(server).sort()).toEqual([
+        'configured',
+        'enabled',
+        'name',
+        'probeAvailable',
+        'probeKey',
+        'probeUnavailableReason',
+        'scope',
+        'source',
+        'status',
+      ])
     }
   })
 
@@ -185,7 +219,7 @@ describe('MCP preset 组合聚合（agentPresets[].rows）', () => {
     const snap = await catalog.snapshot()
     expect(snap.mode).toBe('config')
     expect(snap.servers).toEqual([
-      {
+      configEntry({
         name: 'preset.mcp.notes',
         enabled: true,
         configured: true,
@@ -193,7 +227,7 @@ describe('MCP preset 组合聚合（agentPresets[].rows）', () => {
         source: 'unknown',
         scope: 'preset',
         preset: { id: 'ptc', name: 'PTC' },
-      },
+      }),
     ])
   })
 
@@ -221,7 +255,7 @@ describe('MCP preset 组合聚合（agentPresets[].rows）', () => {
     })
     const snap = await catalog.snapshot()
     expect(snap.servers).toEqual([
-      {
+      configEntry({
         name: '@deepseek-ai/dsh-mcp-client',
         enabled: true,
         configured: true,
@@ -229,7 +263,7 @@ describe('MCP preset 组合聚合（agentPresets[].rows）', () => {
         source: 'unknown',
         scope: 'preset',
         preset: { id: 'standard' },
-      },
+      }),
     ])
   })
 
@@ -446,12 +480,12 @@ describe('MCP 托管聚合（官方 mcpManager 晚绑定，未来环境）', () 
     const snap = await catalog.snapshot()
     expect(snap.mode).toBe('managed')
     expect(snap.servers).toEqual([
-      { name: 'notes', enabled: true, configured: true, status: 'connected', toolCount: 7, source: 'unknown', scope: 'unknown' },
-      { name: 'docs', enabled: false, configured: true, status: 'disabled', source: 'unknown', scope: 'unknown' },
-      { name: 'flaky', enabled: true, configured: true, status: 'reconnecting', source: 'unknown', scope: 'unknown' },
-      { name: 'waiting', enabled: true, configured: true, status: 'waiting-credentials', source: 'unknown', scope: 'unknown' },
-      { name: 'gave-up', enabled: true, configured: true, status: 'failed', source: 'unknown', scope: 'unknown' },
-      { name: 'removed', enabled: true, configured: false, status: 'failed', source: 'unknown', scope: 'unknown' },
+      managedEntry({ name: 'notes', enabled: true, configured: true, status: 'connected', toolCount: 7, source: 'unknown', scope: 'unknown' }),
+      managedEntry({ name: 'docs', enabled: false, configured: true, status: 'disabled', source: 'unknown', scope: 'unknown' }),
+      managedEntry({ name: 'flaky', enabled: true, configured: true, status: 'reconnecting', source: 'unknown', scope: 'unknown' }),
+      managedEntry({ name: 'waiting', enabled: true, configured: true, status: 'waiting-credentials', source: 'unknown', scope: 'unknown' }),
+      managedEntry({ name: 'gave-up', enabled: true, configured: true, status: 'failed', source: 'unknown', scope: 'unknown' }),
+      managedEntry({ name: 'removed', enabled: true, configured: false, status: 'failed', source: 'unknown', scope: 'unknown' }),
     ])
   })
 
@@ -490,10 +524,10 @@ describe('MCP 托管聚合（官方 mcpManager 晚绑定，未来环境）', () 
     const snap = await catalog.snapshot()
     expect(snap.mode).toBe('managed')
     expect(snap.servers).toEqual([
-      { name: 'good', enabled: true, configured: true, status: 'connected', toolCount: 1, source: 'unknown', scope: 'unknown' },
-      { name: 'nullish', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'unknown' },
-      { name: 'stateless', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'unknown' },
-      { name: 'weird', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'unknown' },
+      managedEntry({ name: 'good', enabled: true, configured: true, status: 'connected', toolCount: 1, source: 'unknown', scope: 'unknown' }),
+      managedEntry({ name: 'nullish', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'unknown' }),
+      managedEntry({ name: 'stateless', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'unknown' }),
+      managedEntry({ name: 'weird', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'unknown' }),
     ])
     for (const broken of ['nullish', 'stateless', 'weird']) {
       expect(snap.warnings.some((warning) => warning.includes(broken))).toBe(true)
@@ -521,40 +555,44 @@ describe('MCP 托管聚合（官方 mcpManager 晚绑定，未来环境）', () 
 })
 
 describe('MCP 显式工具探测（仅显式调用；绝不自动触发）', () => {
-  it('probe 成功：透传工具名', async () => {
+  it('probe 成功：返回工具名与稳定结果字段', async () => {
     const catalog = new McpCatalog({
       manager: managerOf([], async () => ({ ok: true, toolNames: ['search', 'fetch'] })),
     })
-    expect(await catalog.probe('notes')).toEqual({ ok: true, toolNames: ['search', 'fetch'] })
-  })
-
-  it('probe 失败：透传阶段与原因', async () => {
-    const catalog = new McpCatalog({
-      manager: managerOf([], async () => ({ ok: false, stage: 'connect', message: 'connection refused' })),
-    })
-    expect(await catalog.probe('flaky')).toEqual({
-      ok: false,
-      code: 'probe_failed',
-      message: 'connection refused',
-      stage: 'connect',
+    expect(await catalog.probe('notes')).toMatchObject({
+      ok: true,
+      probeKey: 'managed:notes',
+      scope: 'unknown',
+      toolNames: ['search', 'fetch'],
+      toolCount: 2,
     })
   })
 
-  it('probe 抛错：归一为 probe_failed 且不外泄堆栈以外的内容', async () => {
+  it('probe 失败：阶段映射为安全 code，原始 message 不透传', async () => {
     const catalog = new McpCatalog({
-      manager: managerOf([], async () => { throw new Error('probe exploded') }),
+      manager: managerOf([], async () => ({ ok: false, stage: 'connect', message: 'https://token@host refused' })),
+    })
+    const outcome = await catalog.probe('flaky')
+    expect(outcome).toMatchObject({ ok: false, code: 'connect', stage: 'connect' })
+    expect(JSON.stringify(outcome)).not.toContain('token@host')
+    expect(outcome.ok === false && outcome.message).toBe('连接 MCP 服务器失败')
+  })
+
+  it('probe 抛错：归一为 connect，且不外泄原始错误', async () => {
+    const catalog = new McpCatalog({
+      manager: managerOf([], async () => { throw new Error('probe exploded at /private/path') }),
     })
     const outcome = await catalog.probe('notes')
     expect(outcome.ok).toBe(false)
-    expect(outcome.code).toBe('probe_failed')
-    expect(outcome.message).toMatch(/probe exploded/)
+    expect(outcome.code).toBe('connect')
+    expect(JSON.stringify(outcome)).not.toContain('/private/path')
   })
 
-  it('无 manager 或 manager 未提供 probe：probe_unavailable（rc.5 能力不可用）', async () => {
+  it('无 manager 或 manager 未提供 probe：unavailable（rc.5 能力不可用）', async () => {
     const noManager = new McpCatalog({ inventory: inventoryOf([MCP_ENTRY]) })
-    expect(await noManager.probe('mcp.notes')).toMatchObject({ ok: false, code: 'probe_unavailable' })
+    expect(await noManager.probe('mcp.notes')).toMatchObject({ ok: false, code: 'unavailable' })
     const noProbeMethod = new McpCatalog({ manager: managerOf([]) })
-    expect(await noProbeMethod.probe('notes')).toMatchObject({ ok: false, code: 'probe_unavailable' })
+    expect(await noProbeMethod.probe('notes')).toMatchObject({ ok: false, code: 'unavailable' })
   })
 })
 
@@ -569,9 +607,9 @@ describe('toolCount 有限性', () => {
     })
     const snap = await catalog.snapshot()
     expect(snap.servers).toEqual([
-      { name: 'nan', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
-      { name: 'inf', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
-      { name: 'ok', enabled: true, configured: true, status: 'connected', toolCount: 3, source: 'unknown', scope: 'unknown' },
+      managedEntry({ name: 'nan', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' }),
+      managedEntry({ name: 'inf', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' }),
+      managedEntry({ name: 'ok', enabled: true, configured: true, status: 'connected', toolCount: 3, source: 'unknown', scope: 'unknown' }),
     ])
   })
 })

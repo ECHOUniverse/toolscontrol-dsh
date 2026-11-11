@@ -9,6 +9,9 @@ import { describe, expect, it } from 'vitest'
 import {
   NS,
   en,
+  probeAvailabilityText,
+  probeReasonText,
+  probeStageText,
   sourceLabel,
   warningTexts,
   zh,
@@ -223,5 +226,68 @@ describe('Warning 本地化与回退', () => {
     expect(warningTexts(['raw'], [{ code: 'skills.unavailable' }, { code: 'mcp.duplicates' }], zhT)).toEqual([
       zh['warning.skills.unavailable'],
     ])
+  })
+})
+
+describe('MCP 独立探测文案', () => {
+  const PROBE_REASONS = [
+    'disabled',
+    'conditional',
+    'config_missing',
+    'config_unresolved',
+    'unsupported_transport',
+    'probe_unavailable',
+  ] as const
+  const PROBE_STAGES = ['connect', 'tools_list', 'timeout', 'cancelled', 'unavailable', 'disabled', 'transport', 'unknown'] as const
+  const AVAILABILITY_REASONS = ['config_source_unavailable', 'runtime_unavailable', 'unknown'] as const
+
+  it('capabilityNote 不再宣称工具探测不可用，而是说明可手动独立探测', () => {
+    expect(zh['mcp.capabilityNote']).not.toContain('工具探测不可用')
+    expect(zh['mcp.capabilityNote']).toContain('独立探测')
+    expect(en['mcp.capabilityNote'].toLowerCase()).not.toContain('probing is unavailable')
+    expect(en['mcp.capabilityNote'].toLowerCase()).toContain('independent probe')
+    // 两条降级说明分别覆盖「探测配置不可读」与「旧 Host 无此能力」。
+    expect(zh['mcp.probeUnavailableNote']).toContain('{reason}')
+    expect(zh['mcp.probeMissingNote']).toMatch(/旧版/)
+  })
+
+  it('所有不可探测原因、失败阶段与能力降级原因都有双语文案', () => {
+    for (const reason of PROBE_REASONS) {
+      const key = `mcp.probeReason.${reason}` as keyof typeof zh
+      expect(zh[key], key).toBeTruthy()
+      expect(en[key], key).toBeTruthy()
+    }
+    for (const stage of PROBE_STAGES) {
+      const key = `mcp.probeStage.${stage}` as keyof typeof zh
+      expect(zh[key], key).toBeTruthy()
+      expect(en[key], key).toBeTruthy()
+    }
+    for (const reason of AVAILABILITY_REASONS) {
+      const key = `mcp.probeAvailability.${reason}` as keyof typeof zh
+      expect(zh[key], key).toBeTruthy()
+      expect(en[key], key).toBeTruthy()
+    }
+  })
+
+  it('探测结果文案包含时间/耗时/工具数/失败详情等占位符', () => {
+    expect(zh['mcp.probe.probedAt']).toContain('{time}')
+    expect(zh['mcp.probe.duration']).toContain('{ms}')
+    expect(zh['mcp.probe.success']).toContain('{n}')
+    expect(zh['mcp.probe.toolsToggle']).toContain('{n}')
+    expect(zh['mcp.probe.failed']).toContain('{reason}')
+    expect(zh['mcp.probeAll']).toContain('{n}')
+  })
+
+  it('原因/阶段/可用性本地化，未知值回退到安全的未知文案', () => {
+    expect(probeReasonText('disabled', zhT)).toBe(zh['mcp.probeReason.disabled'])
+    expect(probeReasonText('conditional', enT)).toBe(en['mcp.probeReason.conditional'])
+    expect(probeReasonText(undefined, zhT)).toBe(zh['mcp.probeReason.probe_unavailable'])
+    expect(probeReasonText('future_reason', zhT)).toBe(zh['mcp.probeReason.probe_unavailable'])
+    expect(probeStageText('connect', zhT)).toBe(zh['mcp.probeStage.connect'])
+    expect(probeStageText('timeout', enT)).toBe(en['mcp.probeStage.timeout'])
+    expect(probeStageText(undefined, zhT)).toBe(zh['mcp.probeStage.unknown'])
+    expect(probeStageText('future_stage', zhT)).toBe(zh['mcp.probeStage.unknown'])
+    expect(probeAvailabilityText('runtime_unavailable', zhT)).toBe(zh['mcp.probeAvailability.runtime_unavailable'])
+    expect(probeAvailabilityText(undefined, zhT)).toBe(zh['mcp.probeAvailability.unknown'])
   })
 })

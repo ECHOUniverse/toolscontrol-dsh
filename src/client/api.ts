@@ -8,6 +8,13 @@
  * human-readable message; payloads are structurally sanity-checked before
  * being trusted.
  *
+ * Probe requests carry exactly `{ probeKey }` — never a display name, config
+ * or credential material. The response is checked field-by-field so a
+ * malformed/legacy payload is rejected instead of being rendered.
+ *
+ * Network failures are reduced to a fixed, URL-free message: a raw `fetch`
+ * error can embed the request URL, so it must never reach the UI.
+ *
  * @module @hanxu131/toolscontrol-dsh/client/api
  */
 
@@ -36,6 +43,50 @@ function assertOverview(data: unknown): OverviewSnapshot {
   return data as OverviewSnapshot
 }
 
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+/**
+ * Structural sanity check of one probe response.
+ *
+ * Success must carry `probeKey`, `probedAt`, `durationMs`, `toolNames`
+ * (strings) and `toolCount`; failure must carry `probeKey`, `stage`, `code`,
+ * `message` and `durationMs`. Anything else is malformed and rejected with a
+ * fixed message (the payload may come from an older/mismatched Host).
+ */
+function assertProbe(data: unknown): McpProbeResponse {
+  if (data === null || typeof data !== 'object') throw new Error('probe payload is malformed')
+  const candidate = data as Record<string, unknown>
+  if (typeof candidate.probeKey !== 'string' || candidate.probeKey === '') {
+    throw new Error('probe payload is malformed')
+  }
+  if (candidate.ok === true) {
+    const names = candidate.toolNames
+    if (!Array.isArray(names) || !names.every((name) => typeof name === 'string')) {
+      throw new Error('probe payload is malformed')
+    }
+    if (
+      !isFiniteNumber(candidate.probedAt) ||
+      !isFiniteNumber(candidate.durationMs) ||
+      !isFiniteNumber(candidate.toolCount)
+    ) {
+      throw new Error('probe payload is malformed')
+    }
+    return data as McpProbeResponse
+  }
+  if (candidate.ok !== false) throw new Error('probe payload is malformed')
+  if (
+    typeof candidate.stage !== 'string' ||
+    typeof candidate.code !== 'string' ||
+    typeof candidate.message !== 'string' ||
+    !isFiniteNumber(candidate.durationMs)
+  ) {
+    throw new Error('probe payload is malformed')
+  }
+  return data as McpProbeResponse
+}
+
 /**
  * `GET /toolscontrol/overview?cwd=…&sessionId=…` (both omitted for the
  * global view; sessionId selects the session's preset skill scope).
@@ -55,18 +106,28 @@ export async function fetchOverview(args: { cwd?: string; sessionId?: string; si
   return assertOverview(await response.json())
 }
 
-/** Explicit `POST /toolscontrol/mcp/probe` for ONE server (user-triggered only). */
-export async function probeServer(args: { server: string; signal: AbortSignal }): Promise<McpProbeResponse> {
-  const response = await fetch(ROUTES.probe, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ server: args.server }),
-    signal: args.signal,
-  })
-  if (!response.ok) throw new Error(await errorMessageOf(response))
-  const data: unknown = await response.json()
-  if (data === null || typeof data !== 'object' || !('ok' in data)) {
-    throw new Error('probe payload is malformed')
+/**
+ * Explicit `POST /toolscontrol/mcp/probe` for ONE entry, keyed by the
+ * Host-issued stable `probeKey` (user-triggered only; never automatic).
+ */
+export async function probeByKey(args: { probeKey: string; signal: AbortSignal }): Promise<McpProbeResponse> {
+  let response: Response
+  try {
+    response = await fetch(ROUTES.probe, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ probeKey: args.probeKey }),
+      signal: args.signal,
+    })
+  } catch {
+    // Fixed, URL-free message: the raw fetch error may contain the endpoint
+    // (or other request details) and must never be surfaced.
+    throw new Error('probe request failed')
   }
-  return data as McpProbeResponse
+  if (!response.ok) throw new Error(await errorMessageOf(response))
+  const answer = assertProbe(await response.json())
+  // The Host must echo the key that was asked for; a mismatched payload is
+  // never published under the requested key.
+  if (answer.probeKey !== args.probeKey) throw new Error('probe payload is malformed')
+  return answer
 }

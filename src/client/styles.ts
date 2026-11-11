@@ -238,8 +238,25 @@ export const CSS = String.raw`
   font-size: 12px;
   overflow-wrap: anywhere;
 }
-.dshTcProbe { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
-.dshTcToolList { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; justify-content: flex-end; }
+.dshTcProbe {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 0.5px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.25));
+}
+.dshTcProbeHead { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.dshTcProbeTitle { font-size: 13px; font-weight: 500; line-height: 20px; }
+.dshTcProbeSummary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.dshTcProbeDetails { font-size: 13px; line-height: 20px; width: 100%; }
+.dshTcProbeDetails > summary {
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary, inherit);
+  width: fit-content;
+}
+.dshTcProbeDetails .dshTcFacts { margin-top: 4px; }
+.dshTcToolList { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 0; padding: 0; list-style: none; justify-content: flex-start; }
 
 /* --- shadowed versions ------------------------------------------------ */
 .dshTcShadowed { display: flex; flex-direction: column; gap: 8px; }

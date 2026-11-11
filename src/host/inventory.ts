@@ -8,6 +8,7 @@
 
 import { PLUGIN_NAME, PLUGIN_VERSION, type McpProbeResponse, type McpSnapshot, type OverviewSnapshot, type SkillsSnapshot } from '../shared/protocol.ts'
 import { errorMessage } from './services.ts'
+import { PROBE_MAX_CONCURRENT, PROBE_TIMEOUT_MS } from './mcp-probe.ts'
 import type { McpCatalog } from './mcp.ts'
 import type { SkillCatalog } from './skills.ts'
 import { warn, warningLog } from './warnings.ts'
@@ -39,9 +40,19 @@ export class OverviewService {
     }
   }
 
-  /** 显式 MCP 工具探测（转发；路由层只在此入口显式触发）。 */
-  probe(server: string): Promise<McpProbeResponse> {
-    return this.mcp.probe(server)
+  /** 旧版按名称显式探测（托管路径兼容；只在此入口显式触发）。 */
+  probe(server: string, options: { signal?: AbortSignal } = {}): Promise<McpProbeResponse> {
+    return this.mcp.probe(server, options)
+  }
+
+  /** 新版稳定 probeKey 单条探测（页面/请求中断可传 AbortSignal）。 */
+  probeByKey(probeKey: string, options: { signal?: AbortSignal } = {}): Promise<McpProbeResponse> {
+    return this.mcp.probeByKey(probeKey, options)
+  }
+
+  /** 插件 dispose：中止所有在途探测并等待连接关闭。 */
+  disposeProbes(): Promise<void> {
+    return this.mcp.disposeProbes()
   }
 }
 
@@ -52,6 +63,15 @@ function degradedMcpSnapshot(reason: unknown): McpSnapshot {
   return {
     mode: 'unavailable',
     capabilities: { connectionStatus: false, toolCount: false, probe: false },
+    probe: {
+      available: false,
+      manualOnly: true,
+      maxConcurrent: PROBE_MAX_CONCURRENT,
+      timeoutMs: PROBE_TIMEOUT_MS,
+      profile: false,
+      presets: false,
+      reason: 'config_source_unavailable',
+    },
     servers: [],
     warnings: warnings.warnings,
     warningItems: warnings.warningItems,

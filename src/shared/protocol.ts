@@ -119,6 +119,45 @@ export interface McpPresetRef {
   name?: string
 }
 
+/**
+ * 单条探测的不可用原因（稳定 code）。它不是连接状态：即使原因为
+ * `config_unresolved`，条目的 `status` 仍可以是 `unknown` 或托管状态。
+ */
+export type McpProbeUnavailableReason =
+  | 'disabled'
+  | 'conditional'
+  | 'config_missing'
+  | 'config_unresolved'
+  | 'unsupported_transport'
+  | 'probe_unavailable'
+
+/**
+ * 独立探测能力（与 `capabilities.probe` 分离）。
+ *
+ * 探测是 Host 侧的短期、手动连接：它不读取也不改变 DSH 当前实例的
+ * 连接状态，`config` 模式下 `connectionStatus` 仍为 false、条目 `status`
+ * 仍为 unknown。`manualOnly` 恒 true，快照读取路径绝不触发探测。
+ */
+export interface McpProbeAvailability {
+  /**
+   * 探测入口是否可用：config 模式下至少一个配置组装面可读；托管模式下
+   * 官方 `mcpManager.probe` 可用。与连接状态无关。
+   */
+  available: boolean
+  /** 恒为 true：只有显式 POST 才会发起连接。 */
+  manualOnly: true
+  /** Host 全局并发上限（所有 probeKey 共享）。 */
+  maxConcurrent: number
+  /** 单条探测总预算（毫秒）。 */
+  timeoutMs: number
+  /** profile 根级 Loader 配置是否可读。 */
+  profile: boolean
+  /** agent preset 声明是否可读。 */
+  presets: boolean
+  /** `available===false` 时的稳定原因 code。 */
+  reason?: 'config_source_unavailable' | 'runtime_unavailable' | (string & {})
+}
+
 /** 一个 MCP 条目（CONTEXT.md「已启用项/已禁用项/连接状态」）。 */
 export interface McpServerEntry {
   /**
@@ -146,6 +185,16 @@ export interface McpServerEntry {
   scope: McpEntryScope
   /** `scope==='preset'` 时的 preset 标识；其它作用域不出现。 */
   preset?: McpPresetRef
+  /**
+   * 稳定探测键（不透明字符串）。包含作用域、presetId 与 entryId，
+   * 同 preset 内重复/空 id 由 Host 稳定消歧；绝不使用展示名作为跨作用域
+   * 唯一键。客户端原样回传该值发起单条显式探测。
+   */
+  probeKey: string
+  /** 该条目当前是否可手动探测（仅真正启用的条目为 true）。 */
+  probeAvailable: boolean
+  /** 不可探测时的稳定原因（与连接状态无关）。 */
+  probeUnavailableReason?: McpProbeUnavailableReason
 }
 
 /** `GET ${ROUTES.overview}` 中 MCP 部分的载荷。 */
@@ -158,6 +207,12 @@ export interface McpSnapshot {
    */
   mode: 'managed' | 'config' | 'unavailable'
   capabilities: McpCapabilities
+  /**
+   * 独立探测能力。与 `capabilities.probe`（托管管理服务自带的 probe）
+   * 分离：rc.5 下 `capabilities.probe` 仍为 false，本字段可独立为 true。
+   * 缺失时客户端必须按「探测不可用」处理（旧 Host 兼容）。
+   */
+  probe?: McpProbeAvailability
   /**
    * 是否完整读取了两个配置组装面（`entries` + `agentPresets[].rows`），
    * 因而足以断言“profile 根级与全部 presets 都没有 MCP server”。
@@ -243,25 +298,60 @@ export interface OverviewSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// MCP 显式探测（POST ${ROUTES.probe}；仅名称，不改任何配置）
+// MCP 显式探测（POST ${ROUTES.probe}；单条、手动、短期连接，不改配置）
 // ---------------------------------------------------------------------------
 
-/** `POST ${ROUTES.probe}` 请求体。 */
+/** `POST ${ROUTES.probe}` 请求体：一次只探测一个条目。 */
 export interface McpProbeRequest {
-  /** 目标 MCP 条目标识（与快照中的 `name` 一致）。 */
-  server: string
+  /** 快照中该条目的稳定探测键（新客户端使用；优先于 `server`）。 */
+  probeKey?: string
+  /** 旧版托管探测：官方 mcpManager 的服务器名称（仅兼容保留）。 */
+  server?: string
 }
 
-/** `POST ${ROUTES.probe}` 响应体：成功含工具名，失败含阶段与原因。 */
-export type McpProbeResponse =
-  | { ok: true; toolNames: string[] }
-  | {
-      ok: false
-      code: 'probe_unavailable' | 'probe_failed' | 'invalid_input'
-      message: string
-      /** 失败阶段（官方 probe 语义；可用时存在）。 */
-      stage?: string
-    }
+/**
+ * 探测失败阶段 / 安全 code。Host 只返回这些固定分类，绝不回传原始错误
+ * 文本（原始错误可能含 URL、凭据或路径）。
+ */
+export type McpProbeStage = 'connect' | 'tools_list' | 'timeout' | 'cancelled' | 'unavailable' | 'disabled'
+
+/** 探测成功：供数量展示与工具名展开。 */
+export interface McpProbeSuccess {
+  ok: true
+  probeKey: string
+  scope: McpEntryScope
+  /** `scope==='preset'` 时存在。 */
+  presetId?: string
+  /** Loader/声明条目标识；无声明 id 时为 null。 */
+  entryId: string | null
+  /** 工具列表读取完成时间（ms epoch；连接关闭随后在返回前完成）。 */
+  probedAt: number
+  /** 探测阶段耗时（毫秒；连接关闭的等待不计入该值）。 */
+  durationMs: number
+  /** 服务端返回的工具名（顺序保持；0 个工具是成功）。 */
+  toolNames: string[]
+  /** `toolNames.length` 的冗余字段，便于数量展示。 */
+  toolCount: number
+}
+
+/** 探测失败：阶段 + 安全 code + 简短且脱敏的 message。 */
+export interface McpProbeFailure {
+  ok: false
+  probeKey: string
+  scope?: McpEntryScope
+  presetId?: string
+  entryId?: string | null
+  /** 失败发生在哪个阶段（与 `code` 同值，独立表达便于 UI 分支）。 */
+  stage: McpProbeStage
+  code: McpProbeStage
+  /** 固定文案，不含 URL/凭据/路径/原始错误。 */
+  message: string
+  /** 探测阶段耗时（毫秒；未能开始时为 0，连接关闭的等待不计入）。 */
+  durationMs: number
+}
+
+/** `POST ${ROUTES.probe}` 响应体：成功含工具名，失败含阶段与安全 code。 */
+export type McpProbeResponse = McpProbeSuccess | McpProbeFailure
 
 // ---------------------------------------------------------------------------
 // Health & error envelope

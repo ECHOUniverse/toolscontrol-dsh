@@ -12,8 +12,9 @@
  *   strictly external, no bundled react runtime) PLUS a full offline
  *   execution: the factory runs against a mock module table and `apply` is
  *   driven against a mock client context with spy transports, asserting the
- *   snapshot is fetched ONLY on tab entry and the probe endpoint is NEVER
- *   called automatically (rc.5 capabilities off).
+ *   snapshot is fetched ONLY on tab entry, the probe endpoint is NEVER
+ *   called automatically (the snapshot declares the independent probe
+ *   capability), and the one explicit probe POST carries only `probeKey`.
  *
  * Exit code non-zero on any failure; every check prints one line.
  */
@@ -76,6 +77,7 @@ check('client: jsx-runtime is an external require', /require\(['"]react\/jsx-run
 check('client: no bundled react runtime', !code.includes('Minified React error'))
 check('client: locale namespace present', code.includes('toolscontrol'))
 check('client: workspace stores consumed', code.includes('sessions') && code.includes('workspaces'))
+check('client: probe requests are keyed by probeKey', code.includes('probeKey'))
 
 // ---------------------------------------------------------------------------
 // Client half: offline execution — mock loader + mock client context
@@ -187,7 +189,19 @@ const snapshot = {
   mcp: {
     mode: 'config',
     capabilities: { connectionStatus: false, toolCount: false, probe: false },
-    servers: [{ name: 'siyuan', enabled: true, configured: true, status: 'unknown', source: 'unknown' }],
+    probe: { available: true, manualOnly: true, maxConcurrent: 2, timeoutMs: 10000, profile: true, presets: true },
+    servers: [
+      {
+        name: 'siyuan',
+        enabled: true,
+        configured: true,
+        status: 'unknown',
+        source: 'unknown',
+        scope: 'profile',
+        probeKey: 'profile:siyuan',
+        probeAvailable: true,
+      },
+    ],
     warnings: [],
   },
   skills: { cwd: null, skills: [], warnings: ['runtime sources cannot be fully enumerated'] },
@@ -195,13 +209,24 @@ const snapshot = {
 
 const fetchCalls = []
 let probeCalls = 0
+const probeArgs = []
 const fetchOverview = (args) => {
   fetchCalls.push(args.cwd ?? null)
   return Promise.resolve(snapshot)
 }
-const probe = () => {
+const probe = (args) => {
   probeCalls += 1
-  return Promise.resolve({ ok: true, toolNames: [] })
+  probeArgs.push(args)
+  return Promise.resolve({
+    ok: true,
+    probeKey: args.probeKey,
+    scope: 'profile',
+    entryId: 'siyuan',
+    probedAt: 1,
+    durationMs: 1,
+    toolNames: [],
+    toolCount: 0,
+  })
 }
 
 const { ctx, registrations, handlers, disposers, sessions } = makeCtx()
@@ -219,22 +244,37 @@ check('tab entry: fetch issued once', fetchCalls.length === 1, `got ${fetchCalls
 await new Promise((resolve) => setTimeout(resolve, 0))
 await Promise.resolve()
 check('tab entry: snapshot ready', tc.getSnapshot().status === 'ready', tc.getSnapshot().status)
-check('tab entry: NO probe after snapshot (rc.5 capabilities off)', probeCalls === 0, `got ${probeCalls}`)
+check('tab entry: NO probe after snapshot (manual only)', probeCalls === 0, `got ${probeCalls}`)
 
-// The one explicit probe path must stay gated: capability off ⇒ no request.
-tc.requestProbe('siyuan')
+// The one explicit probe path is keyed by `probeKey` and sends no other data.
+tc.requestProbe('profile:siyuan')
 await new Promise((resolve) => setTimeout(resolve, 0))
 await Promise.resolve()
-check('explicit probe request with capability off: still no POST', probeCalls === 0, `got ${probeCalls}`)
+check('explicit probe: exactly one request', probeCalls === 1, `got ${probeCalls}`)
+check(
+  'explicit probe: request carries probeKey only',
+  probeArgs[0]?.probeKey === 'profile:siyuan' && Object.keys(probeArgs[0] ?? {}).sort().join(',') === 'probeKey,signal',
+  JSON.stringify(Object.keys(probeArgs[0] ?? {})),
+)
+check(
+  'explicit probe: 0-tool success published',
+  tc.getSnapshot().probes['profile:siyuan']?.phase === 'ok' &&
+    tc.getSnapshot().probes['profile:siyuan']?.toolCount === 0,
+  tc.getSnapshot().probes['profile:siyuan']?.phase,
+)
+// Unknown/disabled keys are ignored client-side.
+tc.requestProbe('profile:missing')
+await new Promise((resolve) => setTimeout(resolve, 0))
+check('explicit probe: unknown probeKey ignored', probeCalls === 1, `got ${probeCalls}`)
 
-// Re-entry refetches; dispose stops everything.
+// Re-entry refetches and clears probe results; dispose stops everything.
 tc.ensure()
 check('tab re-entry: refetches', fetchCalls.length === 2, `got ${fetchCalls.length}`)
 for (const disposer of disposers.reverse()) disposer()
 sessions.set({ ids: ['a'], byId: { a: { id: 'a', cwd: '/a', retainedBy: { mainView: 1 } } } })
 await new Promise((resolve) => setTimeout(resolve, 0))
 check('after dispose: store changes drive no fetch', fetchCalls.length === 2, `got ${fetchCalls.length}`)
-check('never probed during the whole offline run', probeCalls === 0, `got ${probeCalls}`)
+check('exactly one explicit probe during the whole offline run', probeCalls === 1, `got ${probeCalls}`)
 
 // ---------------------------------------------------------------------------
 if (failures > 0) {

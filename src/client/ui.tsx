@@ -12,9 +12,11 @@
  *
  * Strictly read-only: there is NO Switch/toggle/action control — rows expand
  * inline for details (keyboard-reachable buttons with aria-expanded/controls),
- * the only writes on the wire are the explicit probe POST behind the
- * "Load tool list" button, which exists only when the snapshot declares
- * `capabilities.probe`.
+ * the only writes on the wire are the explicit probe POSTs behind the
+ * per-entry "Probe tools" and "Probe all" buttons, which exist only when the
+ * snapshot declares the separate `mcp.probe.available` capability and the
+ * entry itself is enabled/probeAvailable (the legacy `capabilities.probe`
+ * flag is NOT the gate).
  *
  * Services are consumed defensively: the `sessions`/`workspaces` list stores
  * power workspace tracking; a future `remote.mcpManager.watch` (absent in
@@ -26,11 +28,28 @@
  */
 import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { ToolscontrolController, type ClientState, type ControllerDeps as ToolscontrolControllerDeps, type ObservableStore, type ProbeState } from './controller.ts'
-import { fetchOverview, probeServer } from './api.ts'
-import { NS, en, sourceLabel, warningTexts, zh, type MessageTranslate } from './i18n.ts'
+import { fetchOverview, probeByKey } from './api.ts'
+import {
+  NS,
+  en,
+  probeAvailabilityText,
+  probeReasonText,
+  probeStageText,
+  sourceLabel,
+  warningTexts,
+  zh,
+  type MessageTranslate,
+} from './i18n.ts'
 import { CSS } from './styles.ts'
-import type { McpCapabilities, McpConnectionStatus, McpPresetRef, McpServerEntry, SkillEntry } from '../shared/protocol.ts'
-import { mcpEmptyStateKey, skillsScopeLine, type SkillRow } from './view-model.ts'
+import type {
+  McpCapabilities,
+  McpConnectionStatus,
+  McpPresetRef,
+  McpServerEntry,
+  McpSnapshot,
+  SkillEntry,
+} from '../shared/protocol.ts'
+import { isProbeTarget, mcpEmptyStateKey, probeCapabilityAvailable, skillsScopeLine, type SkillRow } from './view-model.ts'
 import type { SessionsListShape, WorkspacesListShape } from './workspace.ts'
 
 /** Translate function bound to this plugin's locale namespace. */
@@ -107,15 +126,6 @@ function formatTime(epoch: number, language: string): string {
 /** Safe DOM id fragment (entry names may contain anything). */
 function idFragment(value: string): string {
   return encodeURIComponent(value).replace(/[%'()*.!]/g, '_')
-}
-
-/**
- * Unique row identity. The same entry name may exist both at the profile root
- * and inside a preset — those are DIFFERENT configuration items, so the key
- * carries the scope and preset id (React keys, expansion state, DOM ids).
- */
-function mcpEntryKey(server: McpServerEntry): string {
-  return `${server.scope}:${server.preset?.id ?? ''}:${server.name}`
 }
 
 /** Human label of a preset reference (official display name when present). */
@@ -223,6 +233,8 @@ function Toolbar(props: {
   onQuery: (query: string) => void
   onRefresh: () => void
   t: TranslateFn
+  /** Optional tab-specific actions (the MCP tab's "probe all"); Skills passes none. */
+  actions?: ReactNode
 }): ReactNode {
   const { t } = props
   return (
@@ -242,6 +254,7 @@ function Toolbar(props: {
           {props.busy ? <Dot tone="ongoing" /> : null}
           {t('common.refresh')}
         </button>
+        {props.actions}
       </div>
       {props.lastRefreshedAt !== null ? (
         <div className="dshTcMetaLine">
@@ -303,20 +316,30 @@ function ListBody(props: {
 function McpRow(props: {
   server: McpServerEntry
   capabilities: McpCapabilities
+  mcp: McpSnapshot
   probe: ProbeState | undefined
   expanded: boolean
   idBase: string
+  language: string
   onToggle: () => void
-  onProbe: (server: string) => void
+  onProbe: (probeKey: string) => void
   t: TranslateFn
 }): ReactNode {
   const { server, capabilities, probe, t } = props
-  const entryKey = mcpEntryKey(server)
-  const detailId = `${props.idBase}-${idFragment(entryKey)}-detail`
+  // Row identity, expansion and DOM ids all use the Host's stable probeKey:
+  // same-name entries in different scopes never share a key.
+  const detailId = `${props.idBase}-${idFragment(server.probeKey)}-detail`
   const statusKnown = capabilities.connectionStatus === true
   const toolCountKnown = capabilities.toolCount === true && typeof server.toolCount === 'number'
+  const globallyProbeable = probeCapabilityAvailable(props.mcp)
+  const probeable = isProbeTarget(server, props.mcp)
+  const loading = probe?.phase === 'loading'
+  const unavailableReason = !globallyProbeable
+    ? undefined
+    : (server.probeUnavailableReason ??
+      (server.conditional === true ? 'conditional' : server.enabled !== true ? 'disabled' : 'probe_unavailable'))
   return (
-    <li className="dshTcRow" data-mcp-entry={server.name} data-mcp-scope={server.scope}>
+    <li className="dshTcRow" data-mcp-entry={server.name} data-mcp-scope={server.scope} data-probe-key={server.probeKey}>
       <div className="dshTcRowHead">
         <span className="dshTcRowIcon" aria-hidden="true">
           {initialOf(server.name)}
@@ -380,45 +403,95 @@ function McpRow(props: {
               </div>
             ) : null}
           </dl>
-          {capabilities.probe === true ? (
-            <div className="dshTcProbe">
-              <button
-                type="button"
-                className="dshTcBtn"
-                disabled={probe?.phase === 'loading'}
-                onClick={() => {
-                  props.onProbe(server.name)
-                }}
-              >
-                {probe?.phase === 'loading' ? (
-                  <>
-                    <Dot tone="ongoing" />
-                    {t('mcp.probing')}
-                  </>
-                ) : (
-                  t('mcp.loadTools')
-                )}
-              </button>
-              {probe?.phase === 'ok' ? (
-                probe.toolNames.length === 0 ? (
-                  <span className="dshTcMuted">{t('mcp.probeEmpty')}</span>
-                ) : (
-                  <ul className="dshTcToolList">
-                    {probe.toolNames.map((tool) => (
-                      <li key={tool}>
-                        <code className="dshTcCode">{tool}</code>
-                      </li>
-                    ))}
-                  </ul>
-                )
-              ) : null}
-              {probe?.phase === 'failed' ? (
-                <span className="dshTcErrorText" role="alert">
-                  {t('mcp.probeFailed', { message: probe.message ?? '' })}
-                </span>
-              ) : null}
+          <div className="dshTcProbe">
+            <div className="dshTcProbeHead">
+              <span className="dshTcProbeTitle">{t('mcp.probe.title')}</span>
+              {probeable ? (
+                <button
+                  type="button"
+                  className="dshTcBtn"
+                  disabled={loading}
+                  aria-label={t('mcp.probe.run')}
+                  onClick={() => {
+                    props.onProbe(server.probeKey)
+                  }}
+                >
+                  {loading ? (
+                    <>
+                      <Dot tone="ongoing" />
+                      {t('mcp.probe.probing')}
+                    </>
+                  ) : (
+                    t('mcp.probe.run')
+                  )}
+                </button>
+              ) : (
+                <Tag>{t('mcp.probe.notProbeable')}</Tag>
+              )}
             </div>
-          ) : null}
+            {!probeable && unavailableReason !== undefined ? (
+              <span className="dshTcMuted">{probeReasonText(unavailableReason, t)}</span>
+            ) : null}
+            {probe?.phase === 'loading' ? <span className="dshTcMuted">{t('mcp.probe.probing')}</span> : null}
+            {probe?.phase === 'ok' ? (
+              <>
+                <div className="dshTcProbeSummary">
+                  <Tag tone="success">{t('mcp.probe.success', { n: probe.toolCount })}</Tag>
+                  <span className="dshTcMuted">{t('mcp.probe.probedAt', { time: formatTime(probe.probedAt, props.language) })}</span>
+                  <span className="dshTcMuted">{t('mcp.probe.duration', { ms: probe.durationMs })}</span>
+                </div>
+                {probe.toolNames.length === 0 ? (
+                  <span className="dshTcMuted">{t('mcp.probe.emptySuccess')}</span>
+                ) : (
+                  <details className="dshTcProbeDetails">
+                    <summary>{t('mcp.probe.toolsToggle', { n: probe.toolCount })}</summary>
+                    <ul className="dshTcToolList">
+                      {probe.toolNames.map((tool, index) => (
+                        <li key={`${tool}:${String(index)}`}>
+                          <code className="dshTcCode">{tool}</code>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+              </>
+            ) : null}
+            {probe?.phase === 'failed' ? (
+              <>
+                <span className="dshTcErrorText" role="alert">
+                  {t('mcp.probe.failed', {
+                    reason:
+                      probe.transport === true
+                        ? t('mcp.probe.failedTransport')
+                        : probeStageText(probe.code, t),
+                  })}
+                </span>
+                <details className="dshTcProbeDetails">
+                  <summary>{t('mcp.probe.details')}</summary>
+                  <dl className="dshTcFacts">
+                    <div>
+                      <dt>{t('mcp.probe.stage')}</dt>
+                      <dd>
+                        {probe.transport === true
+                          ? t('mcp.probeStage.transport')
+                          : probeStageText(probe.stage, t)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>{t('mcp.probe.code')}</dt>
+                      <dd>
+                        <code className="dshTcCode">{probe.code}</code>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>{t('mcp.probe.durationLabel')}</dt>
+                      <dd>{t('mcp.probe.duration', { ms: probe.durationMs })}</dd>
+                    </div>
+                  </dl>
+                </details>
+              </>
+            ) : null}
+          </div>
         </div>
       ) : null}
     </li>
@@ -455,6 +528,19 @@ export function McpSection(props: SectionProps): ReactNode {
           tc.refresh()
         }}
         t={t}
+        actions={
+          <button
+            type="button"
+            className="dshTcBtn"
+            title={t('mcp.probeAllTitle')}
+            disabled={state.mcpProbeableCount === 0}
+            onClick={() => {
+              tc.requestProbeAll()
+            }}
+          >
+            {t('mcp.probeAll', { n: state.mcpProbeableCount })}
+          </button>
+        }
       />
       <div className="dshTcPills" role="group" aria-label={t('filter.enabled')}>
         <Pill
@@ -511,6 +597,13 @@ export function McpSection(props: SectionProps): ReactNode {
         </div>
       ) : null}
       {mcp !== undefined && mcp.capabilities.connectionStatus === false ? <Notice>{t('mcp.capabilityNote')}</Notice> : null}
+      {mcp !== undefined && !probeCapabilityAvailable(mcp) ? (
+        <Notice>
+          {mcp.probe === undefined
+            ? t('mcp.probeMissingNote')
+            : t('mcp.probeUnavailableNote', { reason: probeAvailabilityText(mcp.probe.reason, t) })}
+        </Notice>
+      ) : null}
       {mcp !== undefined && warningLines.length > 0 ? (
         <Notice>
           {t('warnings.title')}: {warningLines.join(' · ')}
@@ -529,20 +622,22 @@ export function McpSection(props: SectionProps): ReactNode {
       >
         <ul className="dshTcRows" aria-busy={busy}>
           {state.mcpRows.map((server) => {
-            const entryKey = mcpEntryKey(server)
+            const rowKey = server.probeKey
             return (
               <McpRow
-                key={entryKey}
+                key={rowKey}
                 server={server}
                 capabilities={mcp!.capabilities}
-                probe={state.probes[server.name]}
-                expanded={expanded === entryKey}
+                mcp={mcp!}
+                probe={state.probes[rowKey]}
+                expanded={expanded === rowKey}
                 idBase="tc-mcp"
+                language={state.language}
                 onToggle={() => {
-                  setExpanded((current) => (current === entryKey ? null : entryKey))
+                  setExpanded((current) => (current === rowKey ? null : rowKey))
                 }}
-                onProbe={(serverName) => {
-                  tc.requestProbe(serverName)
+                onProbe={(probeKey) => {
+                  tc.requestProbe(probeKey)
                 }}
                 t={t}
               />
@@ -884,7 +979,7 @@ export function apply(ctx: ClientContext, overrides: Partial<ToolscontrolControl
 
   const controller = new ToolscontrolController({
     fetchOverview,
-    probe: probeServer,
+    probe: probeByKey,
     ...(listStoreOf(ctx, 'sessions') !== undefined
       ? { sessions: listStoreOf(ctx, 'sessions') as unknown as ObservableStore<SessionsListShape> }
       : {}),

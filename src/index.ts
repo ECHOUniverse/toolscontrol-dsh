@@ -18,8 +18,12 @@
  * 5. `['mcpManager']` → 未来环境可选挂载：官方 MCP 管理服务存在时提供
  *    真实列表/状态与显式 probe。该服务在 rc.5 不存在——effect 不执行，
  *    结构类型在 host/services.ts 本地声明，不静态依赖任何未发布包。
- * 6. `['webServer', 'connection']` → `/toolscontrol` 只读路由表
+ * 6. `['loader']` + `['agentPresets']` → 独立探测所需的真实配置读面
+ *    （profile 根级 / preset 声明）；缺失时只把条目标为不可探测，
+ *    总览照常工作。
+ * 7. `['webServer', 'connection']` → `/toolscontrol` 只读路由表
  *    （health 公开；overview/probe 经官方信任门）。
+ * 8. 插件 dispose → 中止全部在途探测并等待连接（含 stdio 子进程）关闭。
  *
  * 不做任何写操作：不改 MCP 配置、不写 Skill 文件；快照不携带 env/
  * headers/token 等敏感值。
@@ -34,7 +38,7 @@ import { McpCatalog } from './host/mcp.ts'
 import { SkillCatalog } from './host/skills.ts'
 import { OverviewService } from './host/inventory.ts'
 import { registerRoutes } from './host/routes.ts'
-import { serviceOf, type AgentPresetsFace, type AgentsFace, type ConnectionFace, type HostServices, type McpManagerFace, type PluginInventoryFace, type SkillsRegistryFace, type WebServerFace } from './host/services.ts'
+import { serviceOf, type AgentPresetsFace, type AgentsFace, type ConnectionFace, type HostServices, type LoaderFace, type McpManagerFace, type PluginInventoryFace, type SkillsRegistryFace, type WebServerFace } from './host/services.ts'
 
 /** Bundle id inside a profile composition. */
 export const name = 'toolscontrol'
@@ -65,11 +69,13 @@ export interface Config {
 export function createRuntime(config: Config = {}, services: HostServices = {}): {
   overview: OverviewService
   catalogs: { mcp: McpCatalog; skills: SkillCatalog }
-  dispose: () => void
+  dispose: () => Promise<void>
 } {
   const mcp = new McpCatalog({
     ...(services.pluginInventory !== undefined ? { inventory: services.pluginInventory } : {}),
     ...(services.mcpManager !== undefined ? { manager: services.mcpManager } : {}),
+    ...(services.loader !== undefined ? { loader: services.loader } : {}),
+    ...(services.agentPresets !== undefined ? { presets: services.agentPresets } : {}),
   })
   const skills = new SkillCatalog({
     ...(services.skills !== undefined ? { registry: services.skills } : {}),
@@ -88,8 +94,9 @@ export function createRuntime(config: Config = {}, services: HostServices = {}):
   return {
     overview,
     catalogs: { mcp, skills },
-    dispose: () => {
+    dispose: async () => {
       for (const cleanup of cleanups.reverse()) cleanup()
+      await mcp.disposeProbes()
     },
   }
 }
@@ -125,10 +132,23 @@ export function apply(ctx: Context, config: Config = {}): void {
     return () => skills.detachServices(['agents'])
   })
 
-  // 官方 preset 注册表：解析会话 preset 内自带的 skills 服务（官方同源回退顺序）。
+  // 官方 preset 注册表：解析会话 preset 内自带的 skills 服务（官方同源
+  // 回退顺序），同时作为探测的 preset 声明读面（缺失只降级探测）。
   ctx.inject(['agentPresets'], (svcCtx) => {
-    skills.attachServices({ presets: serviceOf<AgentPresetsFace>(svcCtx, 'agentPresets') })
-    return () => skills.detachServices(['presets'])
+    const presets = serviceOf<AgentPresetsFace>(svcCtx, 'agentPresets')
+    skills.attachServices({ presets })
+    mcp.attachServices({ presets })
+    return () => {
+      skills.detachServices(['presets'])
+      mcp.detachServices(['presets'])
+    }
+  })
+
+  // 官方 Loader：探测需要真实传输配置（command/url/headers/env）；缺失时
+  // profile 条目只标为不可探测，总览照常工作。
+  ctx.inject(['loader'], (svcCtx) => {
+    mcp.attachServices({ loader: serviceOf<LoaderFace>(svcCtx, 'loader') })
+    return () => mcp.detachServices(['loader'])
   })
 
   // 未来环境可选：官方 mcpManager（真实状态 + 显式 probe）；rc.5 无此服务。
@@ -143,6 +163,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       overview,
       connection: serviceOf<ConnectionFace>(svcCtx, 'connection'),
     }))
+
+  // 插件 dispose：中止在途探测并等待连接（含 stdio 子进程）关闭。
+  ctx.effect(() => () => mcp.disposeProbes())
 }
 
 // Re-exported for reviewers and the future client half.

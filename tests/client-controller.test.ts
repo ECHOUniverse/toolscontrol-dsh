@@ -11,7 +11,14 @@ import { resolveWorkspaceContext, NO_WORKSPACE } from '../src/client/workspace.t
 import type { SessionsListShape, WorkspacesListShape } from '../src/client/workspace.ts'
 import { ToolscontrolController } from '../src/client/controller.ts'
 import type { ControllerDeps, ClientState, ObservableStore } from '../src/client/controller.ts'
-import { PLUGIN_NAME, PLUGIN_VERSION, type OverviewSnapshot } from '../src/shared/protocol.ts'
+import {
+  PLUGIN_NAME,
+  PLUGIN_VERSION,
+  type McpProbeResponse,
+  type McpServerEntry,
+  type McpSnapshot,
+  type OverviewSnapshot,
+} from '../src/shared/protocol.ts'
 
 // ---------------------------------------------------------------------------
 // 装置
@@ -49,7 +56,7 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
   return { promise, resolve, reject }
 }
 
-/** rc.5 形态：mode=config、连接状态/工具/probe 能力全关。 */
+/** rc.5 形态：mode=config、连接状态/工具能力关闭，但独立探测可用。 */
 function snapshotOf(cwd: string | null, overrides: Partial<OverviewSnapshot> = {}): OverviewSnapshot {
   return {
     plugin: PLUGIN_NAME,
@@ -58,9 +65,36 @@ function snapshotOf(cwd: string | null, overrides: Partial<OverviewSnapshot> = {
     mcp: {
       mode: 'config',
       capabilities: { connectionStatus: false, toolCount: false, probe: false },
+      probe: {
+        available: true,
+        manualOnly: true,
+        maxConcurrent: 2,
+        timeoutMs: 10_000,
+        profile: true,
+        presets: true,
+      },
       servers: [
-        { name: 'siyuan', enabled: true, configured: true, status: 'unknown', source: 'unknown', scope: 'profile' },
-        { name: 'zotero', enabled: false, configured: true, status: 'unknown', source: 'unknown', scope: 'profile' },
+        {
+          name: 'siyuan',
+          enabled: true,
+          configured: true,
+          status: 'unknown',
+          source: 'unknown',
+          scope: 'profile',
+          probeKey: 'profile:siyuan',
+          probeAvailable: true,
+        },
+        {
+          name: 'zotero',
+          enabled: false,
+          configured: true,
+          status: 'unknown',
+          source: 'unknown',
+          scope: 'profile',
+          probeKey: 'profile:zotero',
+          probeAvailable: false,
+          probeUnavailableReason: 'disabled',
+        },
       ],
       warnings: [],
     },
@@ -144,13 +178,32 @@ function controllerWith(overrides: Partial<ControllerDeps> = {}): {
   const workspaces = new FakeStore<WorkspacesListShape>({ items: [] })
   const controller = new ToolscontrolController({
     fetchOverview: fetch.fn,
-    probe: async () => ({ ok: true, toolNames: [] }),
+    probe: async (args) => successOf(args.probeKey),
     sessions,
     workspaces,
     now: () => 1_000,
     ...overrides,
   })
   return { controller, fetch, sessions, workspaces }
+}
+
+/** 成功探测响应（0 工具也合法）。 */
+function successOf(probeKey: string, toolNames: string[] = []): McpProbeResponse {
+  return {
+    ok: true,
+    probeKey,
+    scope: 'profile',
+    entryId: null,
+    probedAt: 2_000,
+    durationMs: 12,
+    toolNames,
+    toolCount: toolNames.length,
+  }
+}
+
+/** 等待控制器内部 promise 链（fetch/probe 的微任务）稳定。 */
+async function flush(rounds = 4): Promise<void> {
+  for (let index = 0; index < rounds; index += 1) await Promise.resolve()
 }
 
 // ---------------------------------------------------------------------------
@@ -390,119 +443,425 @@ describe('刷新保留旧数据（slice 5a）', () => {
 
   it('成功后清除 probe 结果（旧探测不映射到新快照）', async () => {
     const { controller, fetch } = controllerWith({
-      probe: async () => ({ ok: true, toolNames: ['tool_a'] }),
-    })
-    const managed = snapshotOf(null, {
-      mcp: {
-        mode: 'managed',
-        capabilities: { connectionStatus: true, toolCount: true, probe: true },
-        servers: [{ name: 'siyuan', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown', toolCount: 1 }],
-        warnings: [],
-      },
+      probe: async (args) => successOf(args.probeKey, ['tool_a']),
     })
     controller.ensure()
-    fetch.settle(0, managed)
-    await Promise.resolve()
-    await Promise.resolve()
-    controller.requestProbe('siyuan')
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(stateOf(controller).probes['siyuan']?.phase).toBe('ok')
+    fetch.settle(0, snapshotOf(null))
+    await flush()
+    controller.requestProbe('profile:siyuan')
+    await flush()
+    expect(stateOf(controller).probes['profile:siyuan']?.phase).toBe('ok')
     controller.refresh()
-    fetch.settle(1, managed)
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(stateOf(controller).probes['siyuan']).toBeUndefined()
+    fetch.settle(1, snapshotOf(null))
+    await flush()
+    expect(stateOf(controller).probes['profile:siyuan']).toBeUndefined()
   })
 })
 
 // ---------------------------------------------------------------------------
-// slice 5b：probe 只能显式触发且能力关闭时不调用
+// slice 5b：显式 probe 以 probeKey 为键；能力/条目门控、批量、取消与代次
 // ---------------------------------------------------------------------------
 
-describe('probe 门控（slice 5b）', () => {
-  it('capabilities.probe=false（rc.5）→ 不发起任何 probe 请求', async () => {
-    let probeCalls = 0
+/** 装载一份快照后返回控制器，并统计 probe 调用次数。 */
+async function settledWith(
+  snapshot: OverviewSnapshot,
+  overrides: Partial<ControllerDeps> = {},
+): Promise<{ controller: ToolscontrolController; probeCalls: () => number }> {
+  let calls = 0
+  const { controller, fetch } = controllerWith({
+    probe: async (args) => {
+      calls += 1
+      return successOf(args.probeKey)
+    },
+    ...overrides,
+  })
+  controller.ensure()
+  fetch.settle(0, snapshot)
+  await flush()
+  return { controller, probeCalls: () => calls }
+}
+
+/** 以给定服务器列表构造 config 快照（默认保留可用探测能力）。 */
+function snapshotWithServers(servers: McpServerEntry[], mcpPatch: Partial<McpSnapshot> = {}): OverviewSnapshot {
+  return snapshotOf(null, { mcp: { ...snapshotOf(null).mcp, servers, ...mcpPatch } })
+}
+
+function server(overrides: Partial<McpServerEntry> & { name: string; probeKey: string }): McpServerEntry {
+  return {
+    enabled: true,
+    configured: true,
+    status: 'unknown',
+    source: 'unknown',
+    scope: 'profile',
+    probeAvailable: true,
+    ...overrides,
+  }
+}
+
+describe('显式 probe（probeKey，slice 5b）', () => {
+  it('快照落地不自动 probe；capabilities.probe=false 不再门控', async () => {
+    let calls = 0
     const { controller, fetch } = controllerWith({
-      probe: async () => {
-        probeCalls += 1
-        return { ok: true, toolNames: [] }
+      probe: async (args) => {
+        calls += 1
+        return successOf(args.probeKey)
       },
     })
     controller.ensure()
     fetch.settle(0, snapshotOf(null))
-    await Promise.resolve()
-    await Promise.resolve()
-    controller.requestProbe('siyuan')
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(probeCalls).toBe(0)
-    expect(stateOf(controller).probes['siyuan']).toBeUndefined()
+    await flush()
+    expect(calls).toBe(0)
+    expect(stateOf(controller).probes).toEqual({})
+    // rc.5：capabilities.probe=false，但 mcp.probe.available=true。
+    expect(stateOf(controller).snapshot?.mcp.capabilities.probe).toBe(false)
+    controller.requestProbe('profile:siyuan')
+    await flush()
+    expect(calls).toBe(1)
   })
 
-  it('capabilities.probe=true → 显式点击才 POST；loading/成功/失败可见', async () => {
-    const gates = deferred<{ ok: true; toolNames: string[] } | { ok: false; code: 'probe_failed'; message: string }>()
-    let probeCalls = 0
+  it('mcp.probe 缺失或 available=false → 单条与全部都不发起', async () => {
+    const base = snapshotOf(null).mcp
+    const { probe: _probe, ...missingProbe } = base
+    const missing = snapshotOf(null, { mcp: missingProbe })
+    const unavailable = snapshotOf(null, {
+      mcp: {
+        ...base,
+        probe: { available: false, manualOnly: true, maxConcurrent: 2, timeoutMs: 10_000, profile: false, presets: false, reason: 'config_source_unavailable' },
+      },
+    })
+
+    const first = await settledWith(missing)
+    first.controller.requestProbe('profile:siyuan')
+    first.controller.requestProbeAll()
+    expect(first.probeCalls()).toBe(0)
+    expect(stateOf(first.controller).mcpProbeableCount).toBe(0)
+
+    const second = await settledWith(unavailable)
+    second.controller.requestProbe('profile:siyuan')
+    second.controller.requestProbeAll()
+    expect(second.probeCalls()).toBe(0)
+  })
+
+  it('禁用 / probeAvailable=false / conditional 条目一律不发起', async () => {
+    const { controller, probeCalls } = await settledWith(
+      snapshotWithServers([
+        server({ name: 'off', probeKey: 'profile:off', enabled: false, probeAvailable: false }),
+        server({ name: 'noprobe', probeKey: 'profile:noprobe', probeAvailable: false }),
+        server({ name: 'cond', probeKey: 'profile:cond', conditional: true }),
+        server({ name: 'ok', probeKey: 'profile:ok' }),
+      ]),
+    )
+    controller.requestProbe('profile:off')
+    controller.requestProbe('profile:noprobe')
+    controller.requestProbe('profile:cond')
+    // 不存在的键同样不发起。
+    controller.requestProbe('profile:missing')
+    expect(probeCalls()).toBe(0)
+    // 默认筛选（enabled）下 cond 行仍显示，但只有 ok 计为可探测。
+    expect(stateOf(controller).mcpRows.map((row) => row.probeKey)).toEqual([
+      'profile:cond',
+      'profile:noprobe',
+      'profile:ok',
+    ])
+    expect(stateOf(controller).mcpProbeableCount).toBe(1)
+    controller.requestProbeAll()
+    expect(probeCalls()).toBe(1)
+  })
+
+  it('单条：loading → ok，保留观测时间/耗时/工具名/数量；重复点击被忽略', async () => {
+    const gate = deferred<McpProbeResponse>()
+    const requested: { probeKey: string; signal: AbortSignal }[] = []
+    const { controller } = await settledWith(snapshotOf(null), {
+      probe: (args) => {
+        requested.push(args)
+        return gate.promise
+      },
+    })
+    controller.requestProbe('profile:siyuan')
+    expect(requested).toHaveLength(1)
+    expect(requested[0]!.probeKey).toBe('profile:siyuan')
+    expect(requested[0]!.signal).toBeInstanceOf(AbortSignal)
+    expect(stateOf(controller).probes['profile:siyuan']).toEqual({ probeKey: 'profile:siyuan', phase: 'loading' })
+
+    // loading 中重复点击：忽略，不叠加请求。
+    controller.requestProbe('profile:siyuan')
+    expect(requested).toHaveLength(1)
+
+    gate.resolve(successOf('profile:siyuan', ['paper_search', 'read_doc']))
+    await flush()
+    expect(stateOf(controller).probes['profile:siyuan']).toEqual({
+      probeKey: 'profile:siyuan',
+      phase: 'ok',
+      probedAt: 2_000,
+      durationMs: 12,
+      toolNames: ['paper_search', 'read_doc'],
+      toolCount: 2,
+      scope: 'profile',
+      entryId: null,
+    })
+  })
+
+  it('成功但 0 工具是明确成功（toolCount=0，工具名空）', async () => {
+    const { controller } = await settledWith(snapshotOf(null))
+    controller.requestProbe('profile:siyuan')
+    await flush()
+    const probe = stateOf(controller).probes['profile:siyuan']
+    expect(probe?.phase).toBe('ok')
+    if (probe?.phase === 'ok') {
+      expect(probe.toolCount).toBe(0)
+      expect(probe.toolNames).toEqual([])
+    }
+  })
+
+  it('失败响应保留 stage/code/message/durationMs，不显示原始错误', async () => {
+    const { controller } = await settledWith(snapshotOf(null), {
+      probe: async (args): Promise<McpProbeResponse> => ({
+        ok: false,
+        probeKey: args.probeKey,
+        scope: 'profile',
+        entryId: null,
+        stage: 'timeout',
+        code: 'timeout',
+        message: '探测超时（10000 毫秒）',
+        durationMs: 10_003,
+      }),
+    })
+    controller.requestProbe('profile:siyuan')
+    await flush()
+    expect(stateOf(controller).probes['profile:siyuan']).toEqual({
+      probeKey: 'profile:siyuan',
+      phase: 'failed',
+      stage: 'timeout',
+      code: 'timeout',
+      message: '探测超时（10000 毫秒）',
+      durationMs: 10_003,
+      scope: 'profile',
+      entryId: null,
+    })
+  })
+
+  it('网络/传输失败只发布安全占位（message 为空），不含 URL/原始错误', async () => {
+    const { controller } = await settledWith(snapshotOf(null), {
+      probe: async () => {
+        throw new Error('failed to fetch http://127.0.0.1:9999/secret?token=abc')
+      },
+    })
+    controller.requestProbe('profile:siyuan')
+    await flush()
+    const probe = stateOf(controller).probes['profile:siyuan']
+    expect(probe).toMatchObject({
+      probeKey: 'profile:siyuan',
+      phase: 'failed',
+      stage: 'unavailable',
+      code: 'unavailable',
+      message: '',
+      durationMs: 0,
+      transport: true,
+    })
+    expect(JSON.stringify(probe)).not.toMatch(/127\.0\.0\.1|token=/)
+  })
+
+  it('同名但不同 probeKey：结果按 probeKey 隔离，互不覆盖', async () => {
+    const gateProfile = deferred<McpProbeResponse>()
+    const gatePreset = deferred<McpProbeResponse>()
+    const servers = [
+      server({ name: 'same', probeKey: 'profile:same', scope: 'profile' }),
+      server({ name: 'same', probeKey: 'preset:p1:same', scope: 'preset', preset: { id: 'p1' } }),
+    ]
+    const { controller } = await settledWith(snapshotWithServers(servers), {
+      probe: (args) => (args.probeKey === 'profile:same' ? gateProfile.promise : gatePreset.promise),
+    })
+    controller.requestProbe('profile:same')
+    controller.requestProbe('preset:p1:same')
+    expect(stateOf(controller).probes['profile:same']?.phase).toBe('loading')
+    expect(stateOf(controller).probes['preset:p1:same']?.phase).toBe('loading')
+
+    gatePreset.resolve({
+      ok: false,
+      probeKey: 'preset:p1:same',
+      stage: 'connect',
+      code: 'connect',
+      message: '连接 MCP 服务器失败',
+      durationMs: 5,
+    })
+    await flush()
+    expect(stateOf(controller).probes['preset:p1:same']?.phase).toBe('failed')
+    expect(stateOf(controller).probes['profile:same']?.phase).toBe('loading')
+
+    gateProfile.resolve({ ...successOf('profile:same', ['tool']), scope: 'profile' })
+    await flush()
+    expect(stateOf(controller).probes['profile:same']).toMatchObject({ phase: 'ok', toolCount: 1 })
+    expect(stateOf(controller).probes['preset:p1:same']).toMatchObject({ phase: 'failed', code: 'connect' })
+  })
+
+  it('requestProbeAll 只处理当前筛选结果中的可探测条目（跳过 loading）', async () => {
+    const requested: string[] = []
+    const gates = new Map<string, { promise: Promise<McpProbeResponse>; resolve: (value: McpProbeResponse) => void }>()
+    const servers = [
+      server({ name: 'alpha', probeKey: 'profile:alpha' }),
+      server({ name: 'beta', probeKey: 'profile:beta' }),
+      server({ name: 'gamma', probeKey: 'profile:gamma', enabled: false, probeAvailable: false }),
+      server({ name: 'delta', probeKey: 'profile:delta', probeAvailable: false }),
+      server({ name: 'epsilon', probeKey: 'profile:epsilon', conditional: true }),
+    ]
+    const { controller } = await settledWith(snapshotWithServers(servers), {
+      probe: (args) => {
+        requested.push(args.probeKey)
+        const gate = deferred<McpProbeResponse>()
+        gates.set(args.probeKey, gate)
+        return gate.promise
+      },
+    })
+    // 默认 enabled 筛选：gamma（禁用）不显示；epsilon 条件启用不算可探测。
+    expect(stateOf(controller).mcpRows.map((row) => row.probeKey)).toEqual([
+      'profile:alpha',
+      'profile:beta',
+      'profile:delta',
+      'profile:epsilon',
+    ])
+    expect(stateOf(controller).mcpProbeableCount).toBe(2)
+
+    // 先手动探测 alpha（仍在途），全部探测必须跳过它、不重复请求。
+    controller.requestProbe('profile:alpha')
+    expect(requested).toEqual(['profile:alpha'])
+    expect(stateOf(controller).mcpProbeableCount).toBe(1)
+    controller.requestProbeAll()
+    expect(requested).toEqual(['profile:alpha', 'profile:beta'])
+
+    // 筛选变化只改变范围，不自动探测。
+    controller.setMcpFilters({ query: 'gamma' })
+    expect(stateOf(controller).mcpProbeableCount).toBe(0)
+    controller.requestProbeAll()
+    expect(requested).toEqual(['profile:alpha', 'profile:beta'])
+
+    // enabled=all 下禁用条目可见，但批量仍跳过。
+    controller.setMcpFilters({ query: '', enabled: 'all' })
+    expect(stateOf(controller).mcpRows.some((row) => row.probeKey === 'profile:gamma')).toBe(true)
+    expect(stateOf(controller).mcpProbeableCount).toBe(0) // alpha/beta 仍在 loading，其余不可探测
+    gates.get('profile:alpha')!.resolve(successOf('profile:alpha'))
+    gates.get('profile:beta')!.resolve(successOf('profile:beta'))
+    await flush()
+    expect(stateOf(controller).mcpProbeableCount).toBe(2)
+  })
+
+  it('批量探测只针对当前搜索词命中的行', async () => {
+    const requested: string[] = []
+    const { controller } = await settledWith(
+      snapshotWithServers([
+        server({ name: 'alpha', probeKey: 'profile:alpha' }),
+        server({ name: 'beta', probeKey: 'profile:beta' }),
+      ]),
+      {
+        probe: async (args) => {
+          requested.push(args.probeKey)
+          return successOf(args.probeKey)
+        },
+      },
+    )
+    controller.setMcpFilters({ query: 'beta' })
+    expect(stateOf(controller).mcpProbeableCount).toBe(1)
+    controller.requestProbeAll()
+    await flush()
+    expect(requested).toEqual(['profile:beta'])
+  })
+
+  it('筛选变化不清空已有探测结果', async () => {
+    const { controller } = await settledWith(snapshotOf(null))
+    controller.requestProbe('profile:siyuan')
+    await flush()
+    expect(stateOf(controller).probes['profile:siyuan']?.phase).toBe('ok')
+    controller.setMcpFilters({ query: 'siyuan' })
+    expect(stateOf(controller).probes['profile:siyuan']?.phase).toBe('ok')
+    controller.setMcpFilters({ enabled: 'all' })
+    expect(stateOf(controller).probes['profile:siyuan']?.phase).toBe('ok')
+  })
+
+  it('dispose 中止全部在途 probe（含批量），迟到结果不得发布', async () => {
+    const gates = new Map<string, { promise: Promise<McpProbeResponse>; resolve: (value: McpProbeResponse) => void }>()
+    const signals = new Map<string, AbortSignal>()
+    const { controller } = await settledWith(
+      snapshotWithServers([
+        server({ name: 'alpha', probeKey: 'profile:alpha' }),
+        server({ name: 'beta', probeKey: 'profile:beta' }),
+      ]),
+      {
+        probe: (args) => {
+          const gate = deferred<McpProbeResponse>()
+          gates.set(args.probeKey, gate)
+          signals.set(args.probeKey, args.signal)
+          return gate.promise
+        },
+      },
+    )
+    controller.requestProbeAll()
+    expect(signals.size).toBe(2)
+    expect(stateOf(controller).probes['profile:alpha']?.phase).toBe('loading')
+    expect(stateOf(controller).probes['profile:beta']?.phase).toBe('loading')
+
+    controller.dispose()
+    expect(signals.get('profile:alpha')?.aborted).toBe(true)
+    expect(signals.get('profile:beta')?.aborted).toBe(true)
+    gates.get('profile:alpha')!.resolve(successOf('profile:alpha', ['late']))
+    gates.get('profile:beta')!.resolve(successOf('profile:beta', ['late']))
+    await flush()
+    expect(stateOf(controller).probes['profile:alpha']?.phase).toBe('loading')
+    expect(stateOf(controller).probes['profile:beta']?.phase).toBe('loading')
+  })
+
+  it('load/refresh 使旧 probe 代次失效并 abort；晚到结果不得重新填入', async () => {
+    const gate = deferred<McpProbeResponse>()
+    let signal: AbortSignal | undefined
     const { controller, fetch } = controllerWith({
       probe: (args) => {
-        probeCalls += 1
-        expect(args.server).toBe('siyuan')
-        return gates.promise
-      },
-    })
-    const managed = snapshotOf(null, {
-      mcp: {
-        mode: 'managed',
-        capabilities: { connectionStatus: true, toolCount: true, probe: true },
-        servers: [{ name: 'siyuan', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown', toolCount: 2 }],
-        warnings: [],
+        signal = args.signal
+        return gate.promise
       },
     })
     controller.ensure()
-    fetch.settle(0, managed)
-    await Promise.resolve()
-    await Promise.resolve()
+    fetch.settle(0, snapshotOf(null))
+    await flush()
 
-    controller.requestProbe('siyuan')
-    expect(probeCalls).toBe(1)
-    expect(stateOf(controller).probes['siyuan']?.phase).toBe('loading')
+    controller.requestProbe('profile:siyuan')
+    expect(stateOf(controller).probes['profile:siyuan']?.phase).toBe('loading')
 
-    // 加载中重复触发被忽略
-    controller.requestProbe('siyuan')
-    expect(probeCalls).toBe(1)
+    // refresh 开始即中止旧探测代次。
+    controller.refresh()
+    expect(signal?.aborted).toBe(true)
+    fetch.settle(1, snapshotOf(null))
+    await flush()
+    expect(stateOf(controller).probes).toEqual({})
 
-    gates.resolve({ ok: true, toolNames: ['mcp__siyuan__query'] })
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(stateOf(controller).probes['siyuan']).toEqual({
-      server: 'siyuan',
-      phase: 'ok',
-      toolNames: ['mcp__siyuan__query'],
-    })
+    // 晚到结果被丢弃，不能重新填入。
+    gate.resolve(successOf('profile:siyuan', ['late']))
+    await flush()
+    expect(stateOf(controller).probes['profile:siyuan']).toBeUndefined()
   })
 
-  it('probe 失败（ok:false）呈现失败信息', async () => {
+  it('fetch 在途时发起的 probe 属于旧快照代次：新快照落地后结果被丢弃', async () => {
+    const gate = deferred<McpProbeResponse>()
+    let signal: AbortSignal | undefined
     const { controller, fetch } = controllerWith({
-      probe: async () => ({ ok: false, code: 'probe_failed', message: 'handshake timed out' }),
-    })
-    const managed = snapshotOf(null, {
-      mcp: {
-        mode: 'managed',
-        capabilities: { connectionStatus: true, toolCount: true, probe: true },
-        servers: [{ name: 'siyuan', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' }],
-        warnings: [],
+      probe: (args) => {
+        signal = args.signal
+        return gate.promise
       },
     })
     controller.ensure()
-    fetch.settle(0, managed)
-    await Promise.resolve()
-    await Promise.resolve()
-    controller.requestProbe('siyuan')
-    await Promise.resolve()
-    await Promise.resolve()
-    const probe = stateOf(controller).probes['siyuan']
-    expect(probe?.phase).toBe('failed')
-    expect(probe?.message).toBe('handshake timed out')
+    fetch.settle(0, snapshotOf(null))
+    await flush()
+
+    // 第二次 fetch 在途（仍展示旧快照），此时允许发起探测。
+    controller.refresh()
+    controller.requestProbe('profile:siyuan')
+    expect(stateOf(controller).probes['profile:siyuan']?.phase).toBe('loading')
+    fetch.settle(1, snapshotOf(null))
+    await flush()
+    expect(signal?.aborted).toBe(true)
+    expect(stateOf(controller).probes).toEqual({})
+
+    gate.resolve(successOf('profile:siyuan', ['late']))
+    await flush()
+    expect(stateOf(controller).probes['profile:siyuan']).toBeUndefined()
   })
 
   it('没有快照时 probe 不触发', async () => {
@@ -510,97 +869,12 @@ describe('probe 门控（slice 5b）', () => {
     const { controller } = controllerWith({
       probe: async () => {
         probeCalls += 1
-        return { ok: true, toolNames: [] }
+        return successOf('profile:siyuan')
       },
     })
-    controller.requestProbe('siyuan')
+    controller.requestProbe('profile:siyuan')
+    controller.requestProbeAll()
     expect(probeCalls).toBe(0)
-  })
-
-  it('两个 server 并发显式 probe：乱序完成各自发布，互不覆盖（按 server 代次）', async () => {
-    const gateA = deferred<{ ok: true; toolNames: string[] } | { ok: false; code: 'probe_failed'; message: string }>()
-    const gateB = deferred<{ ok: true; toolNames: string[] } | { ok: false; code: 'probe_failed'; message: string }>()
-    const requested: string[] = []
-    const { controller, fetch } = controllerWith({
-      probe: (args) => {
-        requested.push(args.server)
-        return args.server === 'alpha' ? gateA.promise : gateB.promise
-      },
-    })
-    const managed = snapshotOf(null, {
-      mcp: {
-        mode: 'managed',
-        capabilities: { connectionStatus: true, toolCount: true, probe: true },
-        servers: [
-          { name: 'alpha', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
-          { name: 'beta', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
-        ],
-        warnings: [],
-      },
-    })
-    controller.ensure()
-    fetch.settle(0, managed)
-    await Promise.resolve()
-    await Promise.resolve()
-
-    // A 先发、仍在途时点击 B
-    controller.requestProbe('alpha')
-    expect(requested).toEqual(['alpha'])
-    controller.requestProbe('beta')
-    expect(requested).toEqual(['alpha', 'beta'])
-    expect(stateOf(controller).probes['alpha']?.phase).toBe('loading')
-    expect(stateOf(controller).probes['beta']?.phase).toBe('loading')
-
-    // B 先完成：B 发布成功，A 不受影响仍 loading
-    gateB.resolve({ ok: true, toolNames: ['tool_beta'] })
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(stateOf(controller).probes['beta']).toEqual({ server: 'beta', phase: 'ok', toolNames: ['tool_beta'] })
-    expect(stateOf(controller).probes['alpha']?.phase).toBe('loading')
-
-    // A 后完成：A 必须正确发布（不得因 B 抢占全局代次而永久丢失）
-    gateA.resolve({ ok: false, code: 'probe_failed', message: 'alpha handshake failed' })
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(stateOf(controller).probes['alpha']).toEqual({ server: 'alpha', phase: 'failed', message: 'alpha handshake failed' })
-    // B 的结果保持原样
-    expect(stateOf(controller).probes['beta']).toEqual({ server: 'beta', phase: 'ok', toolNames: ['tool_beta'] })
-  })
-
-  it('dispose 使全部在途 probe 失效：迟到的结算不得发布', async () => {
-    const gateA = deferred<{ ok: true; toolNames: string[] }>()
-    const gateB = deferred<{ ok: true; toolNames: string[] }>()
-    const requested: string[] = []
-    const { controller, fetch } = controllerWith({
-      probe: (args) => {
-        requested.push(args.server)
-        return args.server === 'alpha' ? gateA.promise : gateB.promise
-      },
-    })
-    const managed = snapshotOf(null, {
-      mcp: {
-        mode: 'managed',
-        capabilities: { connectionStatus: true, toolCount: true, probe: true },
-        servers: [
-          { name: 'alpha', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
-          { name: 'beta', enabled: true, configured: true, status: 'connected', source: 'unknown', scope: 'unknown' },
-        ],
-        warnings: [],
-      },
-    })
-    controller.ensure()
-    fetch.settle(0, managed)
-    await Promise.resolve()
-    await Promise.resolve()
-    controller.requestProbe('alpha')
-    controller.requestProbe('beta')
-    controller.dispose()
-    gateA.resolve({ ok: true, toolNames: ['late_a'] })
-    gateB.resolve({ ok: true, toolNames: ['late_b'] })
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(stateOf(controller).probes['alpha']?.phase).toBe('loading')
-    expect(stateOf(controller).probes['beta']?.phase).toBe('loading')
   })
 })
 

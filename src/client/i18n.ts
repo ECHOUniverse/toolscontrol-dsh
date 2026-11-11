@@ -63,8 +63,14 @@ export const zh = {
   'state.errorTitle': '无法获取数据',
   'state.staleNotice': '刷新失败，仍在显示上一次快照：{message}',
   'warnings.title': '注意事项',
-  // MCP capability degradation
-  'mcp.capabilityNote': '当前 Desktop 版本无法观测 MCP 连接状态与工具数量；状态一律显示为「未知」，工具探测不可用。',
+  // MCP capability degradation (real status/tool count unobservable; probing is separate)
+  'mcp.capabilityNote':
+    '当前 Desktop 版本无法观测 MCP 的实时连接状态与工具数量：连接状态一律显示为「未知」，工具数量不随连接状态更新。可在条目详情中手动执行独立探测读取工具列表（不改变当前连接）。',
+  'mcp.probeUnavailableNote': '当前 Host 无法读取 MCP 探测配置，手动工具探测不可用（{reason}）。',
+  'mcp.probeMissingNote': '当前 Host 版本未提供独立探测能力（旧版 Host），仅展示配置与状态信息。',
+  'mcp.probeAvailability.config_source_unavailable': '探测配置来源不可读',
+  'mcp.probeAvailability.runtime_unavailable': '当前运行时不支持探测',
+  'mcp.probeAvailability.unknown': '原因未知',
   // MCP statuses (open set: unknown labels fall back to the raw value)
   'mcp.status.unknown': '未知',
   'mcp.status.connected': '已连接',
@@ -79,11 +85,39 @@ export const zh = {
   'mcp.entryDisabled': '已禁用',
   'mcp.configured': '已配置',
   'mcp.tools': '工具数量：{n}',
-  'mcp.loadTools': '加载工具列表',
-  'mcp.probing': '探测中…',
-  'mcp.probeFailed': '探测失败：{message}',
-  'mcp.probeEmpty': '未返回任何工具',
   'mcp.detailFor': '{name} 的详情',
+  // MCP explicit probe (independent observation, keyed by probeKey)
+  'mcp.probe.title': '最近探测',
+  'mcp.probe.run': '探测工具',
+  'mcp.probe.probing': '探测中…',
+  'mcp.probe.notProbeable': '不可探测',
+  'mcp.probeAll': '全部探测（{n}）',
+  'mcp.probeAllTitle': '探测当前筛选结果中所有可探测条目',
+  'mcp.probe.success': '探测成功：{n} 个工具',
+  'mcp.probe.probedAt': '观测时间：{time}',
+  'mcp.probe.duration': '耗时：{ms} ms',
+  'mcp.probe.durationLabel': '耗时',
+  'mcp.probe.emptySuccess': '探测成功，服务端未返回任何工具（0 个工具）',
+  'mcp.probe.failed': '探测失败：{reason}',
+  'mcp.probe.failedTransport': '探测请求未完成（网络错误或 Host 响应异常；原始错误已隐藏）',
+  'mcp.probe.details': '安全详情',
+  'mcp.probe.toolsToggle': '查看工具名（{n}）',
+  'mcp.probe.stage': '阶段',
+  'mcp.probe.code': '代码',
+  'mcp.probeReason.disabled': '条目未启用',
+  'mcp.probeReason.conditional': '条件启用（依赖无法静态求值）',
+  'mcp.probeReason.config_missing': '缺少可读取的传输配置',
+  'mcp.probeReason.config_unresolved': '配置表达式无法可靠求值',
+  'mcp.probeReason.unsupported_transport': '传输方式不受支持',
+  'mcp.probeReason.probe_unavailable': '当前 Host 无法探测该条目',
+  'mcp.probeStage.connect': '连接阶段失败',
+  'mcp.probeStage.tools_list': '读取工具列表失败',
+  'mcp.probeStage.timeout': '探测超时',
+  'mcp.probeStage.cancelled': '探测已取消',
+  'mcp.probeStage.unavailable': '探测不可用',
+  'mcp.probeStage.disabled': '条目未启用',
+  'mcp.probeStage.transport': '请求未完成',
+  'mcp.probeStage.unknown': '未知阶段',
   // MCP entry scope (profile root vs preset composition) + honest empty state
   'mcp.scope.profile': 'DSH profile 根级',
   'mcp.scope.preset': 'Preset：{name}',
@@ -183,7 +217,13 @@ export const en: Record<keyof typeof zh, string> = {
   'state.staleNotice': 'Refresh failed; showing the previous snapshot: {message}',
   'warnings.title': 'Notes',
   'mcp.capabilityNote':
-    'This Desktop build cannot observe MCP connection status or tool counts; every status shows as Unknown and tool probing is unavailable.',
+    'This Desktop build cannot observe live MCP connection status or tool counts: status always shows as Unknown, and tool counts are not updated from the connection. Run an explicit independent probe from an entry’s details to read its tool list (the live connection is not affected).',
+  'mcp.probeUnavailableNote': 'This Host cannot read the MCP probe configuration, so manual tool probing is unavailable ({reason}).',
+  'mcp.probeMissingNote':
+    'This Host version does not provide the independent probe capability (older Host); only configuration and status are shown.',
+  'mcp.probeAvailability.config_source_unavailable': 'the probe configuration source is unreadable',
+  'mcp.probeAvailability.runtime_unavailable': 'this runtime does not support probing',
+  'mcp.probeAvailability.unknown': 'unknown reason',
   'mcp.status.unknown': 'Unknown',
   'mcp.status.connected': 'Connected',
   'mcp.status.connecting': 'Connecting',
@@ -196,11 +236,38 @@ export const en: Record<keyof typeof zh, string> = {
   'mcp.entryDisabled': 'Disabled',
   'mcp.configured': 'Configured',
   'mcp.tools': 'Tools: {n}',
-  'mcp.loadTools': 'Load tool list',
-  'mcp.probing': 'Probing…',
-  'mcp.probeFailed': 'Probe failed: {message}',
-  'mcp.probeEmpty': 'No tools returned',
   'mcp.detailFor': 'Details for {name}',
+  'mcp.probe.title': 'Last probe',
+  'mcp.probe.run': 'Probe tools',
+  'mcp.probe.probing': 'Probing…',
+  'mcp.probe.notProbeable': 'Not probeable',
+  'mcp.probeAll': 'Probe all ({n})',
+  'mcp.probeAllTitle': 'Probe every probeable entry in the current filtered results',
+  'mcp.probe.success': 'Probe succeeded: {n} tool(s)',
+  'mcp.probe.probedAt': 'Observed at: {time}',
+  'mcp.probe.duration': 'Duration: {ms} ms',
+  'mcp.probe.durationLabel': 'Duration',
+  'mcp.probe.emptySuccess': 'Probe succeeded; the server returned no tools (0 tools)',
+  'mcp.probe.failed': 'Probe failed: {reason}',
+  'mcp.probe.failedTransport': 'The probe request did not complete (network error or unexpected Host response; the raw error is hidden)',
+  'mcp.probe.details': 'Safe details',
+  'mcp.probe.toolsToggle': 'Tool names ({n})',
+  'mcp.probe.stage': 'Stage',
+  'mcp.probe.code': 'Code',
+  'mcp.probeReason.disabled': 'The entry is not enabled',
+  'mcp.probeReason.conditional': 'Conditionally enabled (its condition cannot be evaluated statically)',
+  'mcp.probeReason.config_missing': 'No readable transport configuration',
+  'mcp.probeReason.config_unresolved': 'The configuration expression cannot be evaluated reliably',
+  'mcp.probeReason.unsupported_transport': 'The transport type is not supported',
+  'mcp.probeReason.probe_unavailable': 'This Host cannot probe the entry',
+  'mcp.probeStage.connect': 'Failed while connecting',
+  'mcp.probeStage.tools_list': 'Failed to read the tool list',
+  'mcp.probeStage.timeout': 'Probe timed out',
+  'mcp.probeStage.cancelled': 'Probe cancelled',
+  'mcp.probeStage.unavailable': 'Probing unavailable',
+  'mcp.probeStage.disabled': 'Entry not enabled',
+  'mcp.probeStage.transport': 'Request did not complete',
+  'mcp.probeStage.unknown': 'Unknown stage',
   'mcp.scope.profile': 'DSH profile root',
   'mcp.scope.preset': 'Preset: {name}',
   'mcp.scope.unknown': 'Unknown scope',
@@ -298,4 +365,34 @@ export function warningTexts(
     const text = t(key, item.params)
     return text === key || text === '' ? raw : text
   })
+}
+
+/** Localized, stable reason of a NOT-probeable entry (unknown codes fall back). */
+export function probeReasonText(reason: string | undefined, t: MessageTranslate): string {
+  const code = typeof reason === 'string' && reason !== '' ? reason : 'probe_unavailable'
+  const key = `mcp.probeReason.${code}`
+  const text = t(key)
+  if (text !== key && text !== '') return text
+  return t('mcp.probeReason.probe_unavailable')
+}
+
+/** Localized probe availability degradation reason (missing `probe` ⇒ legacy note, not this). */
+export function probeAvailabilityText(reason: string | undefined, t: MessageTranslate): string {
+  const code = typeof reason === 'string' && reason !== '' ? reason : 'unknown'
+  const key = `mcp.probeAvailability.${code}`
+  const text = t(key)
+  if (text !== key && text !== '') return text
+  return t('mcp.probeAvailability.unknown')
+}
+
+/**
+ * Localized failure stage/code. Only the Host's fixed stage enum is ever
+ * rendered — never the sanitized-but-raw `message` or a client error string.
+ */
+export function probeStageText(stage: string | undefined, t: MessageTranslate): string {
+  const code = typeof stage === 'string' && stage !== '' ? stage : 'unknown'
+  const key = `mcp.probeStage.${code}`
+  const text = t(key)
+  if (text !== key && text !== '') return text
+  return t('mcp.probeStage.unknown')
 }

@@ -72,6 +72,8 @@ export interface PluginInventoryPresetRowFace {
   entryId: string | null
   moduleName: string
   enabled: boolean | 'conditional'
+  /** 该行自身的 `!!js disabled` 表达式（未求值时存在）。 */
+  condition?: string
 }
 
 /**
@@ -194,6 +196,45 @@ export interface AgentsFace {
  */
 export interface AgentPresetsFace {
   serviceFor(agent: AgentFace, name: 'skills'): SkillsRegistryFace | undefined
+  /**
+   * 官方 `AgentPresetRegistry.compositionInventory()`：读取全部 preset 声明
+   * 及其行启用状态（含 `condition`）。可选：运行时缺失时只降级探测。
+   */
+  compositionInventory?(): Promise<readonly PluginInventoryPresetFace[]>
+  /**
+   * 官方 `AgentPresetRegistry.readDocument(id)`：把单个 preset 的子插件
+   * 列表以 entry-list YAML 返回（含 `!!js` 表达式）。可选：运行时缺失时
+   * 只降级探测。
+   */
+  readDocument?(id: string): Promise<AgentPresetDocumentFace>
+}
+
+/** 官方 `AgentPresetDocument` 的消费子集（YAML 文本用于只读解析）。 */
+export interface AgentPresetDocumentFace {
+  agentPreset: string
+  content: string
+  name?: string
+}
+
+/**
+ * Loader 读面（`ctx.loader`）：只声明探测配置所需字段。`Entry.options.config`
+ * 是官方生效配置（`!!js` 节点保留为 `{__jsExpr}`），`Entry.disabled` 是
+ * Loader 对 `disabled` 表达式的有效求值结果。
+ */
+export interface LoaderEntryFace {
+  id: string
+  disabled: boolean
+  options: {
+    id?: string
+    name?: string
+    config?: unknown
+    group?: boolean | null
+    disabled?: unknown
+  }
+}
+
+export interface LoaderFace {
+  entries(): Iterable<LoaderEntryFace>
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +247,7 @@ export interface HostServices {
   connection?: ConnectionFace
   pluginInventory?: PluginInventoryFace
   mcpManager?: McpManagerFace
+  loader?: LoaderFace
   skills?: SkillsRegistryFace
   agents?: AgentsFace
   agentPresets?: AgentPresetsFace
@@ -223,6 +265,7 @@ export function servicesOf(ctx: unknown): HostServices {
     connection: face<ConnectionFace>('connection'),
     pluginInventory: face<PluginInventoryFace>('pluginInventory'),
     mcpManager: face<McpManagerFace>('mcpManager'),
+    loader: face<LoaderFace>('loader'),
     skills: face<SkillsRegistryFace>('skills'),
     agents: face<AgentsFace>('agents'),
     agentPresets: face<AgentPresetsFace>('agentPresets'),

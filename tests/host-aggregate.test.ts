@@ -64,6 +64,6 @@ describe('总览聚合快照', () => {
   it('probe 委托给 MCP 目录（显式探测入口）', async () => {
     const overview = new OverviewService(new McpCatalog({}), new SkillCatalog({}))
     const outcome = await overview.probe('anything')
-    expect(outcome).toMatchObject({ ok: false, code: 'probe_unavailable' })
+    expect(outcome).toMatchObject({ ok: false, code: 'unavailable' })
   })
 })
